@@ -1,0 +1,29 @@
+{
+  "name": "mp-api",
+  "version": "0.1.0",
+  "productName": "MP API",
+  "description": "Локальные выгрузки из API маркетплейсов",
+  "private": true,
+  "main": "src/main.cjs",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "package:windows": "node scripts/package-windows.cjs"
+  },
+  "dependencies": {
+    "exceljs": "4.4.0",
+    "lossless-json": "4.3.4"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "45.4.1"
+  }
+}
