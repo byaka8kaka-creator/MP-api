@@ -60,7 +60,8 @@ async function fixture(t, handler) {
   let clock = Date.now();
   const wait = async ms => { clock += ms; };
   const limiter = new LimitScheduler({ wait, now: () => clock });
-  return { store, service, user, requests, run: runId => executeRun(store, runId, service.credentials(runId), { limiter, wait }) };
+  return { store, service, user, requests,
+    run: (runId, options) => executeRun(store, runId, service.credentials(runId), { limiter, wait, ...options }) };
 }
 
 test('три шаблона работают через HTTP, разбивают период и список, сохраняют страницы и XLSX', async t => {
@@ -129,6 +130,31 @@ test('три шаблона работают через HTTP, разбивают
   const csv = await exportRun(store, run, 'csv');
   assert.match(await fs.readFile(path.join(csv, '01-Сборочные задания FBS.csv'), 'utf8'), /9223372036854775806/);
   assert.doesNotMatch(await logTail(runLog(store, runId)), /fixture-(token|key|clientId)/);
+});
+
+test('сетевой журнал сохраняет адрес, метод и причину сбоя без значений параметров и ключей', async t => {
+  const fx = await fixture(t);
+  const runId = fx.service.createRun(fx.user, { kind: 'test', entry: {
+    templateId: 'yandex-shipments', values: '{"campaignId":1234567890,"orderIds":[9876543210]}',
+  } });
+  await fx.run(runId, { fetcher: async (_url, options) => {
+    assert.equal(options.headers.get('api-key'), 'fixture-key');
+    const error = new Error('net::ERR_NAME_NOT_RESOLVED');
+    throw new TypeError('Internal URL contains fixture-key', { cause: error });
+  } });
+  const log = await logTail(runLog(fx.store, runId));
+  assert.doesNotMatch(log, /fixture-key|1234567890|9876543210|Internal URL/);
+  const events = log.trim().split('\n').map(line => JSON.parse(line));
+  const requests = events.filter(item => item.type === 'request');
+  const failures = events.filter(item => item.type === 'network_error');
+  assert.equal(requests[0].method, 'PUT');
+  assert.equal(requests[0].url, 'https://api.partner.market.yandex.ru/v2/campaigns/%7BcampaignId%7D/first-mile/shipments');
+  assert.deepEqual(requests[0].queryFields, ['limit']);
+  assert.deepEqual(requests[0].bodyFields, ['orderIds']);
+  assert.deepEqual(requests.map(item => item.attempt), [1, 2, 3]);
+  assert.deepEqual(failures.map(item => item.code), Array(3).fill('ERR_NAME_NOT_RESOLVED'));
+  assert.ok(failures.every(item => Number.isSafeInteger(item.elapsedMs)));
+  assert.match(fx.store.run(runId).progress.sources[0].error, /DNS.*ERR_NAME_NOT_RESOLVED/);
 });
 
 test('неверная структура и повтор курсора дают неполный результат без потери строк', async t => {

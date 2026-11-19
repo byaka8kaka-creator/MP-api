@@ -1,3 +1,4 @@
+const { net } = require('electron');
 const { Store } = require('./core/store.cjs');
 const { LimitScheduler } = require('./core/limits.cjs');
 const { executeRun, problem } = require('./core/runner.cjs');
@@ -8,6 +9,7 @@ const port = process.parentPort;
 const store = new Store(root, { seed: false });
 const limiter = new LimitScheduler();
 const active = new Map();
+const fetcher = (url, options) => net.fetch(url.href, options);
 
 port.on('message', async ({ data }) => {
   const { action, runId, requestId } = data;
@@ -36,7 +38,7 @@ port.on('message', async ({ data }) => {
   const controller = new AbortController();
   active.set(runId, controller);
   try {
-    await executeRun(store, runId, data.credentials, { limiter, signal: controller.signal });
+    await executeRun(store, runId, data.credentials, { limiter, fetcher, signal: controller.signal });
   } catch (error) {
     const run = store.run(runId);
     store.updateRun(runId, 'interrupted', { ...run.progress, error: problem(error) });

@@ -408,7 +408,8 @@ function requestFor(source, values, position, credentials = null) {
   }
   if (position.value !== undefined) add(template.pagination.target, template.pagination.parameter, position.value);
   const origin = baseUrl(base);
-  const url = position.link ? new URL(position.link, origin) : new URL(relative.slice(1), origin.href.replace(/\/?$/, '/'));
+  const basePath = origin.href.replace(/\/?$/, '/');
+  const url = position.link ? new URL(position.link, origin) : new URL(relative.slice(1), basePath);
   demand(url.origin === origin.origin && !url.username && !url.password && !url.hash, 'Ссылка следующей страницы ведёт за пределы подключения.');
   if (!position.link) url.search = query.toString();
   if (credentials !== null) {
@@ -424,7 +425,8 @@ function requestFor(source, values, position, credentials = null) {
     headers.set('content-type', 'application/json');
     serialized = stringify(body);
   }
-  return { url, method: template.method, headers, body: serialized };
+  const logPath = position.link ? '/[next-page-path]' : new URL(template.path.slice(1), basePath).pathname;
+  return { url, method: template.method, headers, body: serialized, logPath, bodyFields: Object.keys(body) };
 }
 
 function* batches(source, values) {

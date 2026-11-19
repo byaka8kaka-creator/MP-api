@@ -48,17 +48,58 @@ function safeDetail(raw, credentials) {
     return '';
   }
   if (!result) return '';
+  return redactCredentials(result, credentials).replace(/\s+/g, ' ').trim().slice(0, 240);
+}
+
+function redactCredentials(text, credentials) {
   for (const value of Object.values(credentials)) {
     if (typeof value !== 'string' || !value) continue;
-    result = result.replaceAll(value, '[скрыто]').replaceAll(encodeURIComponent(value), '[скрыто]');
+    text = text.replaceAll(value, '[скрыто]').replaceAll(encodeURIComponent(value), '[скрыто]');
   }
-  return result.replace(/Bearer\s+\S+/gi, 'Bearer [скрыто]').replace(/\s+/g, ' ').trim().slice(0, 240);
+  return text.replace(/Bearer\s+\S+/gi, 'Bearer [скрыто]');
+}
+
+function networkCode(error, depth = 0) {
+  if (!error || depth >= 5) return undefined;
+  if (error.name === 'TimeoutError') return 'TIMEOUT';
+  const nested = networkCode(error.cause, depth + 1);
+  if (nested) return nested;
+  if (Array.isArray(error.errors)) {
+    for (const cause of error.errors.slice(0, 8)) {
+      const code = networkCode(cause, depth + 1);
+      if (code) return code;
+    }
+  }
+  if (error.message === 'Redirect was cancelled') return 'REDIRECT_BLOCKED';
+  const chromium = /^net::(ERR_[A-Z_0-9]+)$/.exec(error.message)?.[1];
+  return chromium ?? (/^[A-Z][A-Z_0-9]{2,64}$/.test(error.code) ? error.code : undefined);
+}
+
+function networkFailure(error, timeout, status) {
+  const code = timeout?.aborted ? 'TIMEOUT' : networkCode(error) ?? 'NETWORK_ERROR';
+  let reason = status ? 'Соединение прервалось при чтении ответа API' : 'Не получен HTTP-ответ от API';
+  if (/NAME_NOT_RESOLVED|DNS|ENOTFOUND|EAI_AGAIN/.test(code)) reason = 'Не удалось определить IP-адрес API (DNS)';
+  if (/PROXY|TUNNEL/.test(code)) reason = 'Не удалось пройти через прокси';
+  if (/CERT|SSL|TLS|SELF_SIGNED|ISSUER|VERIFY_LEAF/.test(code)) reason = 'Ошибка TLS или проверки сертификата API';
+  if (/TIMEOUT|TIMEDOUT|TIMED_OUT/.test(code)) reason = 'Истёк тайм-аут HTTP-запроса';
+  if (/REFUSED/.test(code) && !/PROXY/.test(code)) reason = 'Сервер отклонил соединение';
+  if (code === 'REDIRECT_BLOCKED') reason = 'API вернул перенаправление';
+  return { code, reason };
 }
 
 async function receive(source, values, position, credentials, context) {
-  const { fetcher, limiter, signal, onWait, onRequest, onResponse, onRetry } = context;
+  const { fetcher, limiter, signal, onWait, onRequest, onResponse, onNetworkError, onRetry } = context;
   const request = requestFor(source, values, position, credentials);
-  if (request.body) demand(Buffer.byteLength(request.body) <= source.template.maxBodyBytes, 'JSON-тело превышает лимит байт.');
+  const bodyBytes = Buffer.byteLength(request.body ?? '');
+  demand(bodyBytes <= source.template.maxBodyBytes, 'JSON-тело превышает лимит байт.');
+  const mask = value => redactCredentials(value, credentials);
+  const description = {
+    method: request.method,
+    url: mask(request.url.origin + request.logPath),
+    queryFields: [...new Set(request.url.searchParams.keys())].map(mask),
+    bodyFields: request.bodyFields.map(mask),
+    bodyBytes,
+  };
   const attempts = source.template.safeToRetry ? 3 : 1;
   for (let attempt = 1; ; attempt++) {
     const release = await limiter.acquire(source, values, credentials, signal, onWait);
@@ -66,25 +107,33 @@ async function receive(source, values, position, credentials, context) {
     let headers;
     let raw;
     let transportError;
+    let retryDelay;
+    let timeout;
+    const started = performance.now();
     try {
-      onRequest(attempt);
-      const timeout = AbortSignal.timeout(source.template.timeoutMs);
-      const response = await fetcher(request.url, {
-        method: request.method, headers: request.headers, body: request.body, redirect: 'manual',
-        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-      });
-      status = response.status;
-      headers = response.headers;
-      if (!response.ok) {
-        try { raw = await responseText(response, 16 * 1024); } catch { raw = ''; }
-      } else {
-        raw = await responseText(response, source.template.maxResponseBytes);
+      await onRequest(attempt, description);
+      try {
+        timeout = AbortSignal.timeout(source.template.timeoutMs);
+        const response = await fetcher(request.url, {
+          method: request.method, headers: request.headers, body: request.body, redirect: 'manual',
+          credentials: 'omit', cache: 'no-store',
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+        });
+        status = response.status;
+        headers = response.headers;
+        if (!response.ok) {
+          try { raw = await responseText(response, 16 * 1024); } catch { raw = ''; }
+        } else {
+          raw = await responseText(response, source.template.maxResponseBytes);
+        }
+      } catch (error) {
+        transportError = error;
       }
-    } catch (error) {
-      transportError = error;
+    } finally {
+      retryDelay = release(status, headers);
     }
-    const retryDelay = release(status, headers);
-    if (status) await onResponse(status, attempt);
+    const elapsedMs = Math.round(performance.now() - started);
+    if (status) await onResponse(status, attempt, elapsedMs);
     signal?.throwIfAborted();
     if (!transportError && status >= 200 && status < 300) {
       let payload = null;
@@ -93,10 +142,11 @@ async function receive(source, values, position, credentials, context) {
       }
       return { status, raw, payload, url: request.url };
     }
-    const error = transportError instanceof InputError ? transportError : transportError
-      ? new InputError('Нет ответа от API или истёк тайм-аут запроса.')
-      : new HttpProblem(status, retryDelay, safeDetail(raw, credentials));
-    const transient = Boolean(transportError && !(transportError instanceof InputError)) ||
+    const network = transportError && !(transportError instanceof InputError) ? networkFailure(transportError, timeout, status) : null;
+    if (network) await onNetworkError(attempt, elapsedMs, network.code);
+    const error = network ? new InputError(`${network.reason} (${network.code}).`)
+      : (transportError ?? new HttpProblem(status, retryDelay, safeDetail(raw, credentials)));
+    const transient = Boolean(network && network.code !== 'REDIRECT_BLOCKED') ||
       status >= 500 || [420, 429].includes(status);
     if (!transient || attempt >= attempts) throw error;
     const delay = Math.max(retryDelay ?? 0, 500 * 2 ** (attempt - 1));
@@ -182,11 +232,15 @@ async function executeSource(store, run, index, secrets, context, update) {
             run.progress.waiting = { source: index, until: Date.now() + delay };
             update('waiting');
           },
-          onRequest: () => {
+          onRequest: (attempt, request) => {
             delete run.progress.waiting;
             update('running');
+            return trace('request', { batch: batchIndex + 1, page: page + 1, attempt, ...request });
           },
-          onResponse: (status, attempt) => trace('http', { batch: batchIndex + 1, page: page + 1, status, attempt }),
+          onResponse: (status, attempt, elapsedMs) =>
+            trace('http', { batch: batchIndex + 1, page: page + 1, status, attempt, elapsedMs }),
+          onNetworkError: (attempt, elapsedMs, code) =>
+            trace('network_error', { batch: batchIndex + 1, page: page + 1, attempt, elapsedMs, code }),
           onRetry: (delay, attempt) => trace('retry', { batch: batchIndex + 1, page: page + 1, delay, attempt }),
         });
         if (page === 0 && batchIndex === 0 && http.raw) {
