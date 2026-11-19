@@ -342,13 +342,43 @@ function checkValue(value, spec, label) {
   }
 }
 
-function inputValues(template, supplied, allowUnresolved = false) {
+function resolveDates(value, spec, runDay) {
+  if (['date', 'datetime'].includes(spec.type) && object(value) && Object.hasOwn(value, 'daysFromRun')) {
+    const timed = spec.type === 'datetime';
+    demand(Number.isSafeInteger(value.daysFromRun) && Object.keys(value).every(key =>
+      key === 'daysFromRun' || (timed && key === 'time')), 'Введите целое смещение даты в днях.');
+    const calendar = new Date(0);
+    calendar.setUTCFullYear(runDay.getFullYear(), runDay.getMonth(), runDay.getDate() + value.daysFromRun);
+    demand(Number.isFinite(calendar.getTime()) && calendar.getUTCFullYear() >= 1 && calendar.getUTCFullYear() <= 9999,
+      'Смещение выводит дату за допустимый диапазон.');
+    if (!timed) return calendar.toISOString().slice(0, 10);
+    demand(typeof value.time === 'string' && /^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(value.time),
+      'Укажите время динамической даты в формате ЧЧ:ММ.');
+    const [hours, minutes, seconds = 0] = value.time.split(':').map(Number);
+    const local = new Date(runDay);
+    local.setFullYear(calendar.getUTCFullYear(), calendar.getUTCMonth(), calendar.getUTCDate());
+    local.setHours(hours, minutes, seconds, 0);
+    return local.toISOString();
+  }
+  if (spec.type === 'array' && Array.isArray(value)) {
+    return value.map(item => resolveDates(item, spec.items, runDay));
+  }
+  if (spec.type === 'object' && spec.properties && object(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key, Object.hasOwn(spec.properties, key) ? resolveDates(item, spec.properties[key], runDay) : item,
+    ]));
+  }
+  return value;
+}
+
+function inputValues(template, supplied, allowUnresolved = false, runDay = null) {
   demand(object(supplied), 'Значения параметров должны быть объектом.');
   demand(Object.keys(supplied).every(name => template.parameters.some(param => param.name === name)), 'Передан неизвестный параметр.');
   const result = {};
   for (const spec of template.parameters) {
     if (spec.reference?.mode === 'all' && allowUnresolved) continue;
-    const value = Object.hasOwn(supplied, spec.name) ? supplied[spec.name] : spec.default;
+    const entered = Object.hasOwn(supplied, spec.name) ? supplied[spec.name] : spec.default;
+    const value = runDay ? resolveDates(entered, spec, runDay) : entered;
     checkValue(value, spec, spec.label);
     if (value !== undefined) result[spec.name] = value;
   }

@@ -308,3 +308,50 @@ test('расписание догоняет только последнее со
   assert.equal(due.start, true);
   assert.equal(due.scheduledFor, start);
 });
+
+test('расписание сдвигает относительный период каждый день и сохраняет фиксированные даты', async t => {
+  const fx = await fixture(t, () => ({ body: '{"orders":[],"next":0}' }));
+  const firstDay = new Date(2026, 4, 12, 9);
+  const nextDay = new Date(2026, 4, 13, 9);
+  const values = '{"dateFrom":{"daysFromRun":-1},"dateTo":{"daysFromRun":0}}';
+  const jobId = fx.service.saveJob(fx.user, { name: 'Скользящий период', format: 'csv',
+    schedule: { days: [0, 1, 2, 3, 4, 5, 6], time: '09:00' },
+    entries: [
+      { templateId: 'wb-orders', values },
+      { templateId: 'wb-orders', values: '{"dateFrom":"2026-05-01","dateTo":"2026-05-02"}' },
+    ],
+  });
+  fx.store.scheduleJob(jobId, firstDay.valueOf() - 1000, null, null);
+  const started = [];
+  const enqueue = runId => started.push(runId);
+  await fx.service.startScheduled(firstDay.valueOf(), enqueue);
+  await fx.run(started[0]);
+  await fx.service.startScheduled(nextDay.valueOf(), enqueue);
+  await fx.run(started[1]);
+  assert.equal(started.length, 2);
+  const periods = started.map(id => fx.store.run(id).snapshot.sources.map(({ values }) => [values.dateFrom, values.dateTo]));
+  assert.deepEqual(periods, [
+    [['2026-05-11', '2026-05-12'], ['2026-05-01', '2026-05-02']],
+    [['2026-05-12', '2026-05-13'], ['2026-05-01', '2026-05-02']],
+  ]);
+  assert.equal(fx.store.job(jobId).value.entries[0].values, values);
+  assert.equal(fx.requests[0].url.searchParams.get('dateFrom'), String(Date.parse('2026-05-11T00:00:00Z') / 1000));
+  assert.equal(fx.requests[2].url.searchParams.get('dateTo'), String(Date.parse('2026-05-13T23:59:59Z') / 1000));
+});
+
+test('относительные даты разрешаются во вложенных полях и сохраняют местное время', () => {
+  const connection = validateConnection({ id: 'example', name: 'Example', endpoints: [{ id: 'api', name: 'API', url: 'https://example.com' }] });
+  const template = validateTemplate({ id: 'period', name: 'Period', connectionId: connection.id, endpointId: 'api',
+    method: 'POST', path: '/rows', parameters: [
+      { name: 'period', type: 'object', where: 'body', properties: {
+        start: { type: 'datetime' }, days: { type: 'array', items: { type: 'date' } },
+      } },
+    ], response: { rows: '$' },
+  }, connection);
+  const day = new Date(2026, 2, 8, 23, 15);
+  const values = { period: { start: { daysFromRun: -1, time: '09:30' }, days: [{ daysFromRun: -8 }, '2026-03-08'] } };
+  assert.deepEqual(inputValues(template, values, false, day), {
+    period: { start: new Date(2026, 2, 7, 9, 30).toISOString(), days: ['2026-02-28', '2026-03-08'] },
+  });
+  assert.throws(() => inputValues(template, { period: { days: [{ daysFromRun: 0.5 }] } }, false, day), /целое смещение/);
+});

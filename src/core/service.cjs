@@ -221,7 +221,7 @@ class Service {
     return { connections: connectionMap.size, templates: requests.length };
   }
 
-  source(user, entry, draft = false) {
+  source(user, entry, draft = false, runDay = new Date()) {
     const record = this.store.template(id(entry.templateId));
     demand(record && (draft ? canConfigure(user) : record.published && (canConfigure(user) || record.published.available)),
       'Шаблон недоступен.');
@@ -234,7 +234,7 @@ class Service {
     const { endpoint, profile } = profileFor(source);
     demand(environment !== 'sandbox' || endpoint.sandbox, 'В подключении отсутствует адрес песочницы.');
     const inputs = typeof entry.values === 'string' ? readJson(entry.values, 'Параметры запуска') : entry.values ?? {};
-    source.values = inputValues(template, inputs, true);
+    source.values = inputValues(template, inputs, true, runDay);
     for (const param of template.parameters) {
       if (!param.reference || (param.reference.mode !== 'all' && source.values[param.name] == null)) continue;
       const reference = this.store.dictionary(param.reference.templateId);
@@ -253,9 +253,10 @@ class Service {
     demand(!existing || safeToSee(user, existing.owner), 'Выгрузка недоступна.');
     const owner = existing ? this.store.user(existing.owner) : user;
     demand(Array.isArray(value.entries) && value.entries.length > 0 && value.entries.length <= 30, 'Выберите от 1 до 30 источников.');
+    const runDay = new Date();
     const entries = value.entries.map(item => {
       const entry = { templateId: id(item.templateId), environment: item.environment ?? 'production', values: item.values ?? '{}' };
-      this.source(owner, entry);
+      this.source(owner, entry, false, runDay);
       return entry;
     });
     demand(['xlsx', 'csv'].includes(value.format), 'Выберите XLSX или CSV.');
@@ -267,18 +268,19 @@ class Service {
     return jobId;
   }
 
-  createRun(user, value) {
+  createRun(user, value, now = Date.now()) {
+    const runDay = new Date(now);
     if (value.kind === 'job') {
       const job = this.store.job(id(value.jobId));
       demand(job && safeToSee(user, job.owner), 'Выгрузка недоступна.');
       const actor = this.store.user(job.owner);
-      const snapshot = { format: job.value.format, sources: job.value.entries.map(entry => this.source(actor, entry)),
+      const snapshot = { format: job.value.format, sources: job.value.entries.map(entry => this.source(actor, entry, false, runDay)),
         scheduledFor: value.scheduledFor ?? null };
-      return this.store.createRun({ owner: job.owner, jobId: job.id, name: job.value.name, kind: 'job', snapshot });
+      return this.store.createRun({ owner: job.owner, jobId: job.id, name: job.value.name, kind: 'job', snapshot, now });
     }
     demand(canConfigure(user) && ['test', 'dictionary'].includes(value.kind), 'Запуск доступен настройщику.');
-    const source = this.source(user, value.entry, value.kind === 'test');
-    return this.store.createRun({ owner: user.id, name: source.template.name, kind: value.kind, snapshot: { sources: [source] } });
+    const source = this.source(user, value.entry, value.kind === 'test', runDay);
+    return this.store.createRun({ owner: user.id, name: source.template.name, kind: value.kind, snapshot: { sources: [source] }, now });
   }
 
   credentials(runId) {
@@ -367,7 +369,7 @@ class Service {
         if (!start) return;
         const user = this.store.user(job.owner);
         try {
-          runId = this.createRun(user, { kind: 'job', jobId: job.id, scheduledFor });
+          runId = this.createRun(user, { kind: 'job', jobId: job.id, scheduledFor }, now);
         } catch (error) {
           failure = error instanceof InputError ? error.message : 'Не удалось запланировать выгрузку.';
           const id = this.store.createRun({ owner: job.owner, jobId: job.id, name: job.value.name, kind: 'job',

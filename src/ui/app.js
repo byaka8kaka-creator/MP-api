@@ -327,7 +327,58 @@ function defaults(template) {
     `  ${JSON.stringify(item.name)}: ${item.defaultJson}`).join(',\n') + '\n}';
 }
 
-function parameterValues(template, json, draft = false) {
+function dateValue(param, update) {
+  const timed = param.type === 'datetime';
+  const mode = select([['fixed', 'Фиксированная'], ['relative', 'Относительно дня запуска']]);
+  const fixed = input('', timed ? { placeholder: '2026-05-12T09:00:00+03:00' } : { type: 'date' });
+  const days = input('0', { type: 'number', step: 1 });
+  const clock = input('00:00', { type: 'time', step: 1 });
+  const fixedField = field(param.label, fixed);
+  const movingFields = stack(field('Смещение в днях', days, '−1 — вчера, 0 — сегодня, 1 — завтра'),
+    timed && field('Время по часам компьютера', clock));
+  function showMode() {
+    fixedField.hidden = mode.value === 'relative';
+    movingFields.hidden = !fixedField.hidden;
+  }
+  function save() {
+    if (mode.value === 'relative') {
+      update(JSON.stringify({ daysFromRun: days.valueAsNumber, ...(timed ? { time: clock.value } : {}) }));
+    } else {
+      update(fixed.value ? JSON.stringify(fixed.value) : '');
+    }
+  }
+  mode.addEventListener('change', () => {
+    if (mode.value === 'relative' && fixed.value) {
+      const now = new Date();
+      const picked = timed ? new Date(fixed.value) : new Date(`${fixed.value}T00:00:00Z`);
+      if (Number.isFinite(picked.valueOf())) {
+        const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+        const chosen = timed ? Date.UTC(picked.getFullYear(), picked.getMonth(), picked.getDate()) : picked.valueOf();
+        days.value = String((chosen - today) / 86_400_000);
+        if (timed) clock.value = [picked.getHours(), picked.getMinutes(), picked.getSeconds()]
+          .map(part => String(part).padStart(2, '0')).join(':');
+      }
+    }
+    showMode();
+    save();
+  });
+  for (const control of [fixed, days, clock]) control.addEventListener('input', save);
+  return {
+    node: stack(field(`Тип даты — ${param.label}`, mode), fixedField, movingFields),
+    set(fragment) {
+      let value;
+      try { value = fragment && JSON.parse(fragment); } catch { value = undefined; }
+      const relative = value && typeof value === 'object' && Object.hasOwn(value, 'daysFromRun');
+      mode.value = relative ? 'relative' : 'fixed';
+      fixed.value = typeof value === 'string' ? value : '';
+      days.value = relative ? value.daysFromRun ?? '' : '0';
+      if (timed) clock.value = relative ? value.time ?? '' : '00:00';
+      showMode();
+    },
+  };
+}
+
+function parameterValues(template, json, draft = false, onChange = () => {}) {
   const raw = textarea(json || defaults(template), 7, 'Параметры запуска JSON');
   let fragments;
   const setters = new Map();
@@ -342,12 +393,32 @@ function parameterValues(template, json, draft = false) {
     if (value === '') fragments.delete(name);
     else fragments.set(name, value);
     raw.value = '{\n' + [...fragments].map(([key, child]) => `  ${JSON.stringify(key)}: ${child}`).join(',\n') + '\n}';
+    onChange(raw.value);
   }
-  raw.addEventListener('change', () => { try { sync(); } catch { /* Исполнитель покажет ошибку при сохранении. */ } });
+  raw.addEventListener('change', () => {
+    try { sync(); } catch { /* Исполнитель покажет ошибку при сохранении. */ }
+    onChange(raw.value);
+  });
   const controls = template.parameters.map(param => {
     const reference = param.reference;
     if (reference?.mode === 'all') {
       return h('div', { class: 'field' }, h('span', {}, param.label), h('small', { class: 'caption' }, 'Все значения из сохранённого справочника'));
+    }
+    if (['date', 'datetime'].includes(param.type)) {
+      const date = dateValue(param, value => update(param.name, value));
+      setters.set(param.name, date.set);
+      date.set(fragments.get(param.name));
+      return stack(date.node, reference && dictionaryPicker(template.id, param, draft, fragment => {
+        update(param.name, fragment);
+        date.set(fragment);
+      }));
+    }
+    if (param.type === 'object' && param.properties && !reference) {
+      const properties = Object.entries(param.properties).map(([name, spec]) => ({ name, label: name, ...spec }));
+      const nested = parameterValues({ parameters: properties }, fragments.get(param.name), draft,
+        value => update(param.name, /^\{\s*\}$/.test(value) ? '' : value));
+      setters.set(param.name, nested.set);
+      return h('details', { class: 'fold' }, h('summary', {}, param.label), nested.node);
     }
     let control;
     if (param.type === 'boolean') {
@@ -358,10 +429,10 @@ function parameterValues(template, json, draft = false) {
       control = textarea('', 2, param.label);
       control.placeholder = param.type === 'array' ? '[]' : '{}';
     } else {
-      control = input('', { type: param.type === 'date' ? 'date' : 'text', placeholder: param.defaultJson || '',
+      control = input('', { type: 'text', placeholder: param.defaultJson || '',
         inputmode: ['integer', 'number'].includes(param.type) ? 'decimal' : null });
     }
-    const stringType = ['string', 'date', 'datetime'].includes(param.type);
+    const stringType = param.type === 'string';
     const setControl = fragment => {
       if (stringType) {
         try { control.value = fragment && fragment !== 'null' ? JSON.parse(fragment) : ''; }
@@ -391,6 +462,13 @@ function parameterValues(template, json, draft = false) {
     node: stack(controls.length ? fields(controls) : h('small', { class: 'caption' }, 'У запроса нет входных параметров.'),
       h('details', { class: 'fold' }, h('summary', {}, 'Ввод параметров в JSON'), raw)),
     value: () => raw.value,
+    set(value) {
+      raw.value = value ?? '{}';
+      try { sync(); } catch {
+        fragments = new Map();
+        for (const set of setters.values()) set();
+      }
+    },
   };
 }
 
