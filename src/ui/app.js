@@ -126,8 +126,8 @@ function modal(title, body, footer) {
   editor.replaceChildren(
     h('div', { class: 'dialog-head' }, h('h2', { id: 'dialog-title' }, title), btn('Закрыть', () => editor.close(), 'ghost compact')),
     h('div', { class: 'dialog-body' }, body),
-    footer && h('div', { class: 'dialog-footer' }, footer),
   );
+  if (footer) editor.append(h('div', { class: 'dialog-footer' }, footer));
   if (!editor.open) editor.showModal();
 }
 
