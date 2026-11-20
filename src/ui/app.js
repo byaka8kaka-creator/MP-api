@@ -299,7 +299,7 @@ function jobPage(workspace) {
 
 function runsTable(runs) {
   return table(['Запуск', 'Состояние', 'Получено строк', 'Действия'], runs.map(run => {
-    const rows = Object.values(run.progress.sources ?? {}).reduce((sum, source) => sum + source.rows, 0);
+    const rows = Object.values(run.progress.sources ?? {}).reduce((sum, source) => sum + (source.isDependency ? 0 : source.rows), 0);
     const kind = { job: 'Выгрузка', test: 'Проверка черновика', dictionary: 'Справочник' }[run.kind];
     return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, run.name), h('small', {}, `${kind} · ${time(run.created)}`)),
       h('td', {}, pill(run.state),
@@ -402,7 +402,11 @@ function parameterValues(template, json, draft = false, onChange = () => {}) {
   const controls = template.parameters.map(param => {
     const reference = param.reference;
     if (reference?.mode === 'all') {
-      return h('div', { class: 'field' }, h('span', {}, param.label), h('small', { class: 'caption' }, 'Все значения из сохранённого справочника'));
+      const origin = state.workspace?.options.find(item => item.id === reference.templateId)?.name;
+      const hint = reference.refresh === 'run'
+        ? origin ? `Обновляется из запроса «${origin}» при каждом запуске` : 'Загружается при каждом запуске'
+        : 'Все значения из сохранённого справочника';
+      return h('div', { class: 'field' }, h('span', {}, param.label), h('small', { class: 'caption' }, hint));
     }
     if (['date', 'datetime'].includes(param.type)) {
       const date = dateValue(param, value => update(param.name, value));
@@ -828,8 +832,12 @@ function singleRun(record, kind) {
   const sandbox = Boolean(connection?.endpoints.find(item => item.id === definition.endpointId)?.sandbox);
   const environment = select([['production', 'Рабочая'], ['sandbox', 'Песочница', !sandbox]], sandbox && draft ? 'sandbox' : 'production');
   const params = parameterValues(template, undefined, draft);
+  const hasDependencies = template.parameters.some(parameter => parameter.reference?.refresh === 'run');
   formModal(draft ? 'Проверка черновика' : 'Обновление справочника', [
-    h('p', { class: 'caption' }, draft ? 'Исполнитель получит первую страницу и сохранит образец ответа.' : 'После успешной загрузки новые значения станут доступны в зависимых параметрах.'),
+    h('p', { class: 'caption' }, draft
+      ? hasDependencies ? 'Сначала загрузятся все зависимые данные. Тест основного запроса сохранит образец первой страницы.' :
+        'Исполнитель получит первую страницу и сохранит образец ответа.'
+      : 'После успешной загрузки новые значения станут доступны в зависимых параметрах.'),
     field('Среда API', environment), params.node,
   ], draft ? 'Выполнить запрос' : 'Обновить', () => start({ kind, entry: {
     templateId: record.id, environment: environment.value, values: params.value(),
@@ -863,6 +871,7 @@ async function runDetails(runId) {
     const ready = !active.has(run.state) && (progress.rows > 0 || progress.state === 'completed');
     const saved = Object.entries(run.progress.processingExports ?? {}).filter(([key]) => key.startsWith(`${index}:`));
     return h('div', { class: 'source-card' }, cluster(h('h3', {}, source.name), progress.state && pill(progress.state)),
+      source.isDependency && h('small', { class: 'caption' }, 'Зависимый запрос'),
       h('p', { class: 'caption' }, `${source.version ? `Версия ${source.version}` : 'Черновик'} · ${source.environment === 'sandbox' ? 'Песочница' : 'Рабочая среда'} · Строк ${number.format(progress.rows ?? 0)}`),
       source.processingName && h('small', { class: 'caption' }, `Обработка · ${source.processingName}`),
       progress.error && h('p', { class: 'notice error' }, progress.error),
@@ -876,7 +885,10 @@ async function runDetails(runId) {
           runId, source: index, processingId: key.split(':')[1],
         }), 'compact'))));
   });
-  const hasResults = Object.values(run.progress.sources ?? {}).some(source => source.rows > 0 || source.state === 'completed');
+  const hasResults = run.sources.some((source, index) => {
+    const progress = run.progress.sources?.[index];
+    return !source.isDependency && (progress?.rows > 0 || progress?.state === 'completed');
+  });
   async function exportFile(format) {
     await call('export', { runId, format });
     await refresh(true);

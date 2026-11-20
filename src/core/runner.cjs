@@ -156,32 +156,44 @@ async function receive(source, values, position, credentials, context) {
   }
 }
 
-async function resolveInputs(store, source) {
+async function resolveInputs(store, run, source, signal) {
   const values = { ...source.values };
+  let empty;
   for (const parameter of source.template.parameters) {
     const reference = parameter.reference;
     const runId = source.references[parameter.name];
-    if (!reference || !runId) continue;
-    const dictionary = store.run(runId);
-    demand(dictionary?.state === 'completed', 'Сохранённая версия справочника недоступна.');
+    if (!reference) continue;
+    const live = reference.refresh === 'run';
+    const index = live ? source.liveReferences?.[parameter.name] : 0;
+    if (!live && !runId) continue;
+    const inputRun = live ? run : store.run(runId);
+    if (live) {
+      const dependency = run.snapshot.sources[index];
+      demand(dependency && run.progress.sources[index]?.state === 'completed',
+        `Не удалось получить значения «${parameter.label}» из зависимого запроса «${dependency?.template.name ?? reference.templateId}».`);
+    } else {
+      demand(inputRun?.state === 'completed', 'Сохранённая версия справочника недоступна.');
+    }
+    const input = referenceValues(store, inputRun, reference, index, signal);
     if (reference.mode === 'all') {
       const items = new Map();
-      for await (const value of referenceValues(store, dictionary, reference.path)) {
+      for await (const value of input) {
         items.set(stringify(value), value);
-        demand(items.size <= 1_000_000, 'Справочник слишком велик для одного параметра.');
+        demand(items.size <= 1_000_000, 'Список из зависимого запроса слишком велик для одного параметра.');
       }
+      if (live && items.size === 0) empty ??= parameter.label;
       values[parameter.name] = [...items.values()];
       continue;
     }
     const selection = reference.mode === 'many' ? values[parameter.name] : [values[parameter.name]];
     const expected = new Set(selection.map(value => stringify(value)));
-    for await (const item of referenceValues(store, dictionary, reference.path)) {
+    for await (const item of input) {
       expected.delete(stringify(item));
       if (expected.size === 0) break;
     }
     demand(expected.size === 0, `«${parameter.label}»: выбранных значений нет в сохранённом справочнике.`);
   }
-  return inputValues(source.template, values);
+  return empty ? { empty } : { values: inputValues(source.template, values) };
 }
 
 async function executeSource(store, run, index, secrets, context, update) {
@@ -189,15 +201,23 @@ async function executeSource(store, run, index, secrets, context, update) {
   const progress = run.progress.sources[index];
   const previous = store.pages(run.id, index);
   const credentials = secrets[index] ?? {};
+  const previewOnly = run.kind === 'test' && !source.isDependency;
   const trace = (type, fields) => logEvent(store, run.id, type, { source: index + 1, ...fields });
   progress.rows = previous.reduce((total, page) => total + page.rows, 0);
   progress.state = 'running';
   update('running');
-  if (source.secretExpires && source.secretExpires <= Date.now()) throw new InputError('Истёк срок действия ключа подключения.');
   if (!source.resolved) {
-    source.resolved = await resolveInputs(store, source);
+    const resolved = await resolveInputs(store, run, source, context.signal);
+    if (resolved.empty) {
+      progress.warning = `Зависимый запрос не вернул значений для «${resolved.empty}». HTTP-запрос пропущен.`;
+      progress.state = 'completed';
+      await trace('dependency_empty', { parameter: resolved.empty });
+      return;
+    }
+    source.resolved = resolved.values;
     store.readyRun(run.id, run.snapshot);
   }
+  if (source.secretExpires && source.secretExpires <= Date.now()) throw new InputError('Истёк срок действия ключа подключения.');
   const warning = historyWarning(source.template, source.resolved, new Date(run.created));
   if (warning) progress.warning = warning;
   const pagination = source.template.pagination;
@@ -245,13 +265,13 @@ async function executeSource(store, run, index, secrets, context, update) {
         });
         if (page === 0 && batchIndex === 0 && http.raw) {
           await saveSample(store, run.id, index, http.raw);
-          if (run.kind === 'test') store.linkSample(source.template.id, run.id);
+          if (previewOnly) store.linkSample(source.template.id, run.id);
         }
         const rows = responseRows(source.template.response, http.payload, http.status);
         batchRows += rows.length;
         let next = null;
         let incomplete = null;
-        if (run.kind !== 'test') {
+        if (!previewOnly) {
           try {
             next = nextPosition(pagination, http.payload, rows, position, values, batchRows, http.url);
             demand(!next || !seen.has(stringify(next)), 'Курсор уже использовался. Полученные строки сохранены.');
@@ -279,7 +299,7 @@ async function executeSource(store, run, index, secrets, context, update) {
       errors.push(problem(error));
       await trace('batch_failed', { batch: batchIndex + 1, problem: problem(error) });
     }
-    if (run.kind === 'test') break;
+    if (previewOnly) break;
   }
   if (errors.length) {
     progress.error = errors[0];
@@ -304,9 +324,12 @@ async function executeRun(store, runId, secrets, {
   update('running');
   let state;
   try {
-    for (const [index, source] of run.snapshot.sources.entries()) {
+    const order = run.snapshot.order ?? run.snapshot.sources.map((_, index) => index);
+    for (const index of order) {
+      const source = run.snapshot.sources[index];
       signal?.throwIfAborted();
       const progress = run.progress.sources[index] ??= { rows: 0, name: source.template.name };
+      if (source.isDependency) progress.isDependency = true;
       if (progress.state === 'completed') continue;
       if (source.skipOnRecovery) {
         progress.state = progress.rows > 0 ? 'partial' : 'failed';
@@ -323,7 +346,7 @@ async function executeRun(store, runId, secrets, {
       }
       update('running');
     }
-    const sources = Object.values(run.progress.sources);
+    const sources = run.snapshot.sources.flatMap((source, index) => source.isDependency ? [] : [run.progress.sources[index]]);
     state = sources.every(source => source.state === 'completed') ? 'completed'
       : sources.some(source => source.rows > 0 || source.state === 'completed') ? 'partial' : 'failed';
     if (state === 'completed' && run.kind === 'dictionary') {

@@ -1,0 +1,133 @@
+{
+  "format": "mp-api-config",
+  "version": 1,
+  "connections": [
+    {
+      "id": "wb-advertising",
+      "policyId": "wildberries",
+      "name": "Wildberries · Продвижение",
+      "account": "seller",
+      "endpoints": [
+        { "id": "advert", "name": "Продвижение", "url": "https://advert-api.wildberries.ru" }
+      ],
+      "profiles": [
+        { "id": "default", "name": "Токен Wildberries", "headers": [{ "key": "token", "name": "Authorization" }] }
+      ]
+    }
+  ],
+  "templates": [
+    {
+      "id": "wb-promotion-count",
+      "name": "1. Списки кампаний WB",
+      "connectionId": "wb-advertising",
+      "endpointId": "advert",
+      "folder": "Поисковые кластеры",
+      "method": "GET",
+      "path": "/adv/v1/promotion/count",
+      "available": true,
+      "safeToRetry": true,
+      "limits": [{ "id": "wb-promotion-count", "type": "bucket", "refillMs": 200, "burst": 5 }],
+      "response": {
+        "rows": "adverts",
+        "columns": [
+          { "path": "type", "name": "Тип" },
+          { "path": "status", "name": "Статус" },
+          { "path": "count", "name": "Кампаний" }
+        ],
+        "tables": [
+          { "name": "Кампании", "path": "advert_list", "columns": [
+            { "path": "advertId", "name": "ID кампании" },
+            { "path": "changeTime", "name": "Последнее изменение" }
+          ] }
+        ]
+      }
+    },
+    {
+      "id": "wb-advert-details",
+      "name": "2. Состав кампаний WB",
+      "connectionId": "wb-advertising",
+      "endpointId": "advert",
+      "folder": "Поисковые кластеры",
+      "method": "GET",
+      "path": "/api/advert/v3/adverts",
+      "available": true,
+      "safeToRetry": true,
+      "parameters": [
+        {
+          "name": "advertIds",
+          "label": "ID кампаний",
+          "where": "query",
+          "type": "array",
+          "items": { "type": "integer", "min": 1 },
+          "required": true,
+          "minItems": 1,
+          "batchSize": 50,
+          "encoding": "csv",
+          "reference": {
+            "templateId": "wb-promotion-count",
+            "mode": "all",
+            "refresh": "run",
+            "expand": "advert_list",
+            "path": "advertId"
+          }
+        }
+      ],
+      "limits": [{ "id": "wb-advert-details", "type": "bucket", "refillMs": 200, "burst": 5 }],
+      "response": {
+        "rows": "adverts",
+        "columns": [
+          { "path": "advertId", "name": "ID кампании" },
+          { "path": "settings.name", "name": "Название" },
+          { "path": "status", "name": "Статус" }
+        ],
+        "tables": [
+          { "name": "Товары кампаний", "path": "nms", "columns": [
+            { "path": "$parent.advertId", "name": "ID кампании" },
+            { "path": "nmId", "name": "Артикул WB" }
+          ] }
+        ]
+      }
+    },
+    {
+      "id": "wb-normquery-stats",
+      "name": "3. Статистика поисковых кластеров WB по дням",
+      "connectionId": "wb-advertising",
+      "endpointId": "advert",
+      "folder": "Поисковые кластеры",
+      "method": "POST",
+      "path": "/adv/v1/normquery/stats",
+      "available": true,
+      "safeToRetry": true,
+      "parameters": [
+        { "name": "from", "label": "Начало периода", "where": "body", "type": "date", "required": true },
+        { "name": "to", "label": "Конец периода", "where": "body", "type": "date", "required": true },
+        {
+          "name": "items",
+          "label": "Пары кампаний и артикулов",
+          "where": "body",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "advertId": { "type": "integer", "min": 1, "required": true },
+              "nmId": { "type": "integer", "min": 1, "required": true }
+            }
+          },
+          "required": true,
+          "minItems": 1,
+          "batchSize": 100,
+          "reference": {
+            "templateId": "wb-advert-details",
+            "mode": "all",
+            "refresh": "run",
+            "expand": "nms",
+            "fields": { "advertId": "$parent.advertId", "nmId": "nmId" }
+          }
+        }
+      ],
+      "period": { "from": "from", "to": "to" },
+      "limits": [{ "id": "wb-normquery-stats", "type": "bucket", "refillMs": 6000, "burst": 20 }],
+      "response": { "rows": "items", "columns": [{ "path": "$", "name": "Запись статистики (JSON)" }] }
+    }
+  ]
+}

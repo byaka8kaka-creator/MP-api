@@ -269,7 +269,8 @@ class Service {
     const inputs = typeof entry.values === 'string' ? readJson(entry.values, 'Параметры запуска') : entry.values ?? {};
     source.values = inputValues(template, inputs, true, runDay);
     for (const param of template.parameters) {
-      if (!param.reference || (param.reference.mode !== 'all' && source.values[param.name] == null)) continue;
+      if (!param.reference || param.reference.refresh === 'run' ||
+        (param.reference.mode !== 'all' && source.values[param.name] == null)) continue;
       const reference = this.store.dictionary(param.reference.templateId);
       demand(reference, `Сначала обновите справочник для параметра «${param.label}».`);
       source.references[param.name] = reference.run_id;
@@ -280,19 +281,52 @@ class Service {
     return source;
   }
 
+  planSources(user, entries, draft, runDay) {
+    const sources = entries.map(entry => this.source(user, entry, draft, runDay));
+    const outputCount = sources.length;
+    const dependencies = new Map();
+    const visiting = new Set();
+    const order = [];
+    const addToOrder = index => {
+      const source = sources[index];
+      visiting.add(source.template.id);
+      for (const param of source.template.parameters) {
+        const ref = param.reference;
+        if (ref?.refresh !== 'run') continue;
+        demand(!visiting.has(ref.templateId), 'Настройки создают цикл зависимых запросов.');
+        const key = JSON.stringify([ref.templateId, source.environment]);
+        let dependencyIndex = dependencies.get(key);
+        if (dependencyIndex === undefined) {
+          const entry = { templateId: ref.templateId, environment: source.environment };
+          const dependency = this.source(user, entry, false, runDay);
+          dependencyIndex = sources.length;
+          dependencies.set(key, dependencyIndex);
+          sources.push({ ...dependency, isDependency: true });
+          addToOrder(dependencyIndex);
+        }
+        demand(sources[dependencyIndex].connection.id === source.connection.id, 'Зависимый запрос должен быть из того же подключения.');
+        source.liveReferences ??= {};
+        source.liveReferences[param.name] = dependencyIndex;
+      }
+      visiting.delete(source.template.id);
+      order.push(index);
+    };
+    for (let index = 0; index < outputCount; index++) addToOrder(index);
+    return sources.length === outputCount ? { sources } : { sources, order };
+  }
+
   saveJob(user, value) {
     const jobId = value.id ? id(value.id) : randomUUID();
     const existing = this.store.job(jobId);
     demand(!existing || safeToSee(user, existing.owner), 'Выгрузка недоступна.');
     const owner = existing ? this.store.user(existing.owner) : user;
     demand(Array.isArray(value.entries) && value.entries.length > 0 && value.entries.length <= 30, 'Выберите от 1 до 30 источников.');
-    const runDay = new Date();
     const entries = value.entries.map(item => {
       const entry = { templateId: id(item.templateId), environment: item.environment ?? 'production', values: item.values ?? '{}' };
       if (item.processingId) entry.processingId = id(item.processingId);
-      this.source(owner, entry, false, runDay);
       return entry;
     });
+    this.planSources(owner, entries, false, new Date());
     demand(['xlsx', 'csv'].includes(value.format), 'Выберите XLSX или CSV.');
     const schedule = validateSchedule(value.schedule);
     const job = { id: jobId, name: text(value.name, 'название выгрузки'), folder: folder(value.folder),
@@ -308,13 +342,13 @@ class Service {
       const job = this.store.job(id(value.jobId));
       demand(job && safeToSee(user, job.owner), 'Выгрузка недоступна.');
       const actor = this.store.user(job.owner);
-      const snapshot = { format: job.value.format, sources: job.value.entries.map(entry => this.source(actor, entry, false, runDay)),
+      const snapshot = { format: job.value.format, ...this.planSources(actor, job.value.entries, false, runDay),
         scheduledFor: value.scheduledFor ?? null };
       return this.store.createRun({ owner: job.owner, jobId: job.id, name: job.value.name, kind: 'job', snapshot, now });
     }
     demand(canConfigure(user) && ['test', 'dictionary'].includes(value.kind), 'Запуск доступен настройщику.');
-    const source = this.source(user, value.entry, value.kind === 'test', runDay);
-    return this.store.createRun({ owner: user.id, name: source.template.name, kind: value.kind, snapshot: { sources: [source] }, now });
+    const snapshot = this.planSources(user, [value.entry], value.kind === 'test', runDay);
+    return this.store.createRun({ owner: user.id, name: snapshot.sources[0].template.name, kind: value.kind, snapshot, now });
   }
 
   credentials(runId) {
@@ -337,11 +371,18 @@ class Service {
     const run = this.getRun(user, runId);
     const { snapshot, ...summary } = run;
     return {
-      ...summary, sources: snapshot.sources.map(source => ({
-        name: source.template.name, version: source.version, environment: source.environment,
-        templateId: source.template.id, processingName: source.processing?.name, supportsFunnel: isFunnel(source.template),
-        values: stringify(source.resolved ?? source.values, null, 2),
-      })),
+      ...summary, sources: snapshot.sources.map(source => {
+        const values = { ...(source.resolved ?? source.values) };
+        for (const name of Object.keys(source.liveReferences ?? {})) {
+          const list = values[name];
+          if (Array.isArray(list) && list.length > 100) values[name] = { total: list.length, firstItems: list.slice(0, 100) };
+        }
+        return {
+          name: source.template.name, version: source.version, environment: source.environment,
+          templateId: source.template.id, processingName: source.processing?.name, supportsFunnel: isFunnel(source.template),
+          isDependency: Boolean(source.isDependency), values: stringify(values, null, 2),
+        };
+      }),
     };
   }
 
@@ -363,7 +404,7 @@ class Service {
     const definition = value.draft && canConfigure(user) ? record?.draft : record?.published;
     demand(definition && (canConfigure(user) || definition.available), 'Этот шаблон недоступен.');
     const reference = definition.parameters.find(parameter => parameter.name === value.parameter)?.reference;
-    demand(reference, 'Параметр не связан со справочником.');
+    demand(reference && reference.refresh !== 'run', 'Параметр не связан с ручным справочником.');
     const dictionary = this.store.dictionary(reference.templateId);
     if (!dictionary) return { updated: null, values: [], more: false };
     const run = this.store.run(dictionary.run_id);
@@ -371,7 +412,7 @@ class Service {
     demand(Number.isSafeInteger(offset) && offset >= 0, 'Некорректная страница справочника.');
     const values = [];
     let index = 0;
-    for await (const item of referenceValues(this.store, run, reference.path)) {
+    for await (const item of referenceValues(this.store, run, reference)) {
       if (index++ < offset) continue;
       values.push(stringify(item));
       if (values.length > 100) break;

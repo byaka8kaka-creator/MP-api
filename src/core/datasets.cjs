@@ -102,13 +102,28 @@ async function preview(store, run, source, offset) {
   return { rows: rows.slice(0, 30), more: rows.length > 30 };
 }
 
-async function* referenceValues(store, run, field) {
-  for await (const row of records(store, run, 0)) {
-    const value = get(row, field);
-    if (Array.isArray(value)) {
-      for (const item of value) yield item;
-    } else if (value !== undefined) {
-      yield value;
+async function* referenceValues(store, run, reference, index = 0, signal) {
+  for await (const row of records(store, run, index, signal)) {
+    const items = reference.expand === undefined ? [row] : get(row, reference.expand);
+    demand(Array.isArray(items), `В ответе зависимого запроса отсутствует массив «${reference.expand}».`);
+    for (const item of items) {
+      if (reference.fields) {
+        const fields = Object.entries(reference.fields).map(([name, path]) => {
+          const value = path.startsWith('$parent.') ? get(row, path.slice(8)) : get(item, path);
+          demand(value !== undefined, `В ответе зависимого запроса отсутствует поле «${path}».`);
+          return [name, value];
+        });
+        yield Object.fromEntries(fields);
+        continue;
+      }
+      const value = get(item, reference.path);
+      if (Array.isArray(value)) {
+        yield* value;
+      } else if (value !== undefined) {
+        yield value;
+      } else {
+        demand(reference.refresh !== 'run', `В ответе зависимого запроса отсутствует поле «${reference.path}».`);
+      }
     }
   }
 }
@@ -150,7 +165,7 @@ async function* tabularRows(store, run, sourceIndex, columns, expansion, separat
 
 function tables(store, run, override, sourceIndex) {
   return run.snapshot.sources.flatMap((source, index) => {
-    if (override && index !== sourceIndex) return [];
+    if (override ? index !== sourceIndex : source.isDependency) return [];
     const processing = override ?? source.processing;
     if (processing) return [{
       name: processing.name, headers: processing.columns.map(column => column.name),
@@ -263,8 +278,9 @@ async function writeXlsx(dir, name, definitions, rowLimit) {
 
 async function exportRun(store, run, format, { rowLimit = XLSX_ROWS, processing, sourceIndex } = {}) {
   demand(['xlsx', 'csv'].includes(format), 'Выберите XLSX или CSV.');
-  const sources = processing ? { [sourceIndex]: run.progress.sources?.[sourceIndex] } : run.progress.sources;
-  demand(run.snapshot.sources.length && Object.values(sources ?? {}).some(source =>
+  const sources = processing ? { [sourceIndex]: run.progress.sources?.[sourceIndex] }
+    : Object.fromEntries(Object.entries(run.progress.sources ?? {}).filter(([index]) => !run.snapshot.sources[index]?.isDependency));
+  demand(run.snapshot.sources.length && Object.values(sources).some(source =>
     source?.rows > 0 || source?.state === 'completed'), 'Доступных результатов для экспорта нет.');
   const title = processing?.name ?? run.name;
   const definitions = tables(store, run, processing, sourceIndex);

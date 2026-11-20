@@ -176,10 +176,32 @@ function parameterList(value, profiles, template) {
       result.encoding = spec.encoding;
     }
     if (spec.reference !== undefined) {
-      demand(object(spec.reference) && ['one', 'many', 'all'].includes(spec.reference.mode), 'Укажите режим справочника.');
-      demand(spec.reference.mode === 'one' || result.type === 'array', 'Для нескольких значений справочника нужен массив.');
-      pathParts(spec.reference.path);
-      result.reference = { templateId: id(spec.reference.templateId), path: spec.reference.path, mode: spec.reference.mode };
+      const reference = spec.reference;
+      demand(object(reference) && ['one', 'many', 'all'].includes(reference.mode), 'Укажите режим зависимости.');
+      demand(reference.mode === 'one' || result.type === 'array', 'Для нескольких значений зависимости нужен массив.');
+      result.reference = { templateId: id(reference.templateId), mode: reference.mode };
+      if (reference.refresh !== undefined) {
+        demand(['manual', 'run'].includes(reference.refresh), 'Выберите ручное обновление или обновление при запуске.');
+        demand(reference.refresh !== 'run' || reference.mode === 'all', 'Обновление при запуске требует режима all.');
+        result.reference.refresh = reference.refresh;
+      }
+      if (reference.expand !== undefined) {
+        pathParts(reference.expand);
+        result.reference.expand = reference.expand;
+      }
+      if (reference.fields === undefined) {
+        pathParts(reference.path);
+        result.reference.path = reference.path;
+      } else {
+        demand(reference.path === undefined && result.type === 'array' && result.items.type === 'object' &&
+          object(reference.fields) && Object.keys(reference.fields).length > 0,
+        'Для сборки объектов укажите поля объекта вместо одного пути.');
+        result.reference.fields = Object.fromEntries(Object.entries(reference.fields).map(([name, path]) => {
+          demand(typeof path === 'string', 'Укажите путь каждого поля объекта.');
+          pathParts(path.replace(/^\$parent\./, ''));
+          return [id(name), path];
+        }));
+      }
     }
     return result;
   }), 'name', 'имена параметров');

@@ -424,3 +424,126 @@ test('обработка воронки разворачивает период�
   assert.equal(preview.rows.length, 3);
   assert.equal(preview.rows[1].periodType, 'Предыдущий');
 });
+
+function installAdvertising(fx) {
+  const { service, user, store } = fx;
+  const bundle = require('../examples/wb-search-clusters.json');
+  assert.deepEqual(service.import(user, JSON.stringify(bundle)), { connections: 1, templates: 3 });
+  const connection = store.connections().find(item => item.name === bundle.connections[0].name);
+  const url = store.connection('wildberries').endpoints[0].url;
+  service.saveConnection(user, stringify({ ...connection, endpoints: [{ ...connection.endpoints[0], url }] }));
+  service.credentialSettings(user, {
+    connectionId: connection.id, endpointId: 'advert', profileId: 'default', environment: 'production',
+    values: { token: 'fixture-advert-token' },
+  }, true);
+  const templates = bundle.templates.map(item => store.templates().find(record =>
+    record.draft.connectionId === connection.id && record.draft.path === item.path));
+  assert.throws(() => service.publish(user, templates[2].id), /справочника из того же подключения/);
+  for (const template of templates) service.publish(user, template.id);
+  return templates.map(template => template.id);
+}
+
+test('цепочка WB обновляет состав кампаний и отправляет точные пары порциями по 100', async t => {
+  const countPath = '/adv/v1/promotion/count';
+  const detailPath = '/api/advert/v3/adverts';
+  const statsPath = '/adv/v1/normquery/stats';
+  const ids = Array.from({ length: 50 }, (_, i) => String(100 + i)).concat('9223372036854775807');
+  let campaigns = ids;
+  let productIds = ['10', '9223372036854775806'];
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === countPath) {
+      const list = entries => entries.map(advertId => `{"advertId":${advertId}}`).join(',');
+      return { body: `{"adverts":[{"advert_list":[${list(campaigns.slice(0, 32))}]},{"advert_list":[${list(campaigns.slice(-22))}]}]}` };
+    }
+    if (request.url.pathname === detailPath) {
+      const requested = request.url.searchParams.get('advertIds').split(',');
+      const nms = [...productIds, productIds[0]].map(nmId => `{"nmId":${nmId}}`).join(',');
+      return { body: `{"adverts":[${requested.map(advertId => `{"advertId":${advertId},"nms":[${nms}]}`).join(',')}]}` };
+    }
+    return { body: `{"items":${stringify(parseJson(request.body).items)}}` };
+  });
+  const { service, store, user, requests } = fx;
+  const [countId, detailId, statsId] = installAdvertising(fx);
+  const values = '{"from":{"daysFromRun":-2},"to":{"daysFromRun":-1}}';
+  const day = new Date(2026, 10, 20, 9).valueOf();
+  const entry = { templateId: statsId, values };
+
+  const previewId = service.createRun(user, { kind: 'test', entry }, day);
+  await fx.run(previewId);
+  assert.equal(store.run(previewId).state, 'completed');
+  assert.deepEqual(requests.map(request => request.url.pathname), [countPath, detailPath, detailPath, statsPath]);
+  assert.equal(parseJson(requests.at(-1).body).items.length, 100);
+  assert.equal(store.template(statsId).sample_run_id, previewId);
+  assert.equal(store.template(detailId).sample_run_id, null);
+
+  requests.length = 0;
+  const jobId = service.saveJob(user, { name: 'Кластеры', format: 'csv', entries: [entry],
+    schedule: { days: [0, 1, 2, 3, 4, 5, 6], time: '09:00' } });
+  const id = service.createRun(user, { kind: 'job', jobId }, day);
+  assert.deepEqual(store.run(id).snapshot.order, [2, 1, 0]);
+  await fx.run(id);
+  const first = store.run(id);
+  assert.equal(first.state, 'completed');
+  assert.deepEqual(requests.map(request => request.url.pathname), [countPath, detailPath, detailPath, statsPath, statsPath]);
+  assert.deepEqual(requests.slice(1, 3).map(request => request.url.searchParams.get('advertIds').split(',')), [ids.slice(0, 50), ids.slice(50)]);
+  assert.ok(requests.slice(1, 3).every(request => [...request.url.searchParams.keys()].join() === 'advertIds'));
+  assert.ok(requests.every(request => request.headers.authorization === 'fixture-advert-token'));
+  assert.deepEqual(requests.slice(3).map(request => parseJson(request.body).items.length), [100, 2]);
+  const expected = ids.flatMap(advertId => productIds.map(nmId => `{"advertId":${advertId},"nmId":${nmId}}`));
+  assert.deepEqual(requests.slice(3).flatMap(request => parseJson(request.body).items.map(item => stringify(item))), expected);
+  const result = JSON.parse(await fs.readFile(path.join(first.progress.exportPath, 'результат.json'), 'utf8'));
+  assert.equal(result.tables.length, 1);
+  assert.equal(result.tables[0].rows, 102);
+  assert.deepEqual(Object.keys(result.sources), ['0']);
+  assert.equal(store.dictionary(countId), undefined);
+  assert.equal(store.dictionary(detailId), undefined);
+
+  campaigns = ['100', '999'];
+  productIds = ['77'];
+  requests.length = 0;
+  store.scheduleJob(jobId, day, null, null);
+  const queued = [];
+  await service.startScheduled(new Date(2026, 10, 21, 9).valueOf(), runId => queued.push(runId));
+  await fx.run(queued[0]);
+  assert.deepEqual(requests.map(request => request.url.pathname), [countPath, detailPath, statsPath]);
+  assert.deepEqual(JSON.parse(requests.at(-1).body),
+    { from: '2026-11-19', to: '2026-11-20', items: [{ advertId: 100, nmId: 77 }, { advertId: 999, nmId: 77 }] });
+  assert.deepEqual(store.run(id).snapshot.sources[0].resolved.items.map(item => stringify(item)), expected);
+});
+
+test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
+  let mode = 'empty';
+  const countPath = '/adv/v1/promotion/count';
+  const detailPath = '/api/advert/v3/adverts';
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === countPath) {
+      const adverts = mode === 'empty' ? [] : [{ advert_list: Array.from({ length: 51 }, (_, i) => ({ advertId: i + 1 })) }];
+      return { body: JSON.stringify({ adverts }) };
+    }
+    if (request.url.searchParams.get('advertIds') === '51') return { status: 403, body: '{}' };
+    return { body: '{"adverts":[{"advertId":1,"nms":[{"nmId":10}]}]}' };
+  });
+  const { service, store, user, requests } = fx;
+  const [, , statsId] = installAdvertising(fx);
+  const jobId = service.saveJob(user, { name: 'Кластеры', format: 'csv', entries: [{
+    templateId: statsId, values: '{"from":"2026-11-18","to":"2026-11-19"}',
+  }] });
+  const runId = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(runId);
+  const empty = store.run(runId);
+  assert.equal(empty.state, 'completed');
+  assert.match(empty.progress.sources[0].warning, /HTTP-запрос пропущен/);
+  assert.deepEqual(requests.map(request => request.url.pathname), [countPath]);
+  assert.ok(empty.progress.exportPath);
+
+  mode = 'partial';
+  requests.length = 0;
+  const blocked = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(blocked);
+  const failed = store.run(blocked);
+  assert.equal(failed.state, 'failed');
+  assert.equal(failed.progress.sources[1].state, 'partial');
+  assert.match(failed.progress.sources[0].error, /из зависимого запроса/);
+  assert.deepEqual(requests.map(request => request.url.pathname), [countPath, detailPath, detailPath]);
+  assert.equal(failed.progress.exportPath, undefined);
+});
