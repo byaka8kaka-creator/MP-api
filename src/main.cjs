@@ -228,6 +228,8 @@ async function actions(action, value) {
       return service.saveFolder(user, value);
     case 'job':
       return service.saveJob(user, value);
+    case 'deleteJob':
+      return service.deleteJob(user, value.jobId);
     case 'processing':
       return service.saveProcessing(user, value);
     case 'run': {

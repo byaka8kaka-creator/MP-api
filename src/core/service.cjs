@@ -66,6 +66,7 @@ class Service {
       folders: store.folders().filter(row => row.kind === 'job' ? row.scope === user.id : editor),
       options: visible.map(record => {
         const option = formTemplate(record.published, record.version);
+        if (record.draft.connectionId === option.connectionId) option.folder = record.draft.folder;
         const connection = connections.find(item => item.id === option.connectionId);
         const endpoint = connection?.endpoints.find(item => item.id === record.published.endpointId);
         return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), processingType: processingType(record.published) };
@@ -318,7 +319,7 @@ class Service {
   saveJob(user, value) {
     const jobId = value.id ? id(value.id) : randomUUID();
     const existing = this.store.job(jobId);
-    demand(!existing || safeToSee(user, existing.owner), 'Выгрузка недоступна.');
+    demand(!existing || (existing.deleted_at === null && safeToSee(user, existing.owner)), 'Выгрузка недоступна.');
     const owner = existing ? this.store.user(existing.owner) : user;
     demand(Array.isArray(value.entries) && value.entries.length > 0 && value.entries.length <= 30, 'Выберите от 1 до 30 источников.');
     const entries = value.entries.map(item => {
@@ -332,15 +333,21 @@ class Service {
     const job = { id: jobId, name: text(value.name, 'название выгрузки'), folder: folder(value.folder),
       entries, format: value.format, schedule };
     const unchanged = JSON.stringify(existing?.value.schedule ?? null) === JSON.stringify(schedule);
-    this.store.putJob(job, owner.id, unchanged);
+    demand(this.store.putJob(job, owner.id, unchanged).changes === 1, 'Выгрузка недоступна.');
     return jobId;
+  }
+
+  deleteJob(user, jobId) {
+    const job = this.store.job(id(jobId));
+    demand(job && safeToSee(user, job.owner), 'Выгрузка недоступна.');
+    this.store.deleteJob(job.id);
   }
 
   createRun(user, value, now = Date.now()) {
     const runDay = new Date(now);
     if (value.kind === 'job') {
       const job = this.store.job(id(value.jobId));
-      demand(job && safeToSee(user, job.owner), 'Выгрузка недоступна.');
+      demand(job && job.deleted_at === null && safeToSee(user, job.owner), 'Выгрузка недоступна.');
       const actor = this.store.user(job.owner);
       const snapshot = { format: job.value.format, ...this.planSources(actor, job.value.entries, false, runDay),
         scheduledFor: value.scheduledFor ?? null };
@@ -441,6 +448,7 @@ class Service {
       let runId;
       let failure;
       this.store.transaction(() => {
+        if (this.store.job(job.id)?.deleted_at !== null) return;
         this.store.scheduleJob(job.id, cursor, pendingAt, pendingSlot);
         if (!start) return;
         const user = this.store.user(job.owner);

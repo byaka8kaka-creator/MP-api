@@ -598,3 +598,57 @@ test('обработка кластеров разворачивает dailyStat
   assert.equal(preview.rows[0].stat.normQuery, 'корм');
   assert.equal(preview.rows[1].stat.normQuery, 'сухой корм');
 });
+
+test('удаление выгрузки сохраняет шаблон, обработку и запуски при обновлении базы', async t => {
+  const fx = await fixture(t, () => ({ body: '{"data":{"products":[{"product":{"nmId":11},"statistic":' +
+    '{"selected":{"period":{"start":"2026-11-18","end":"2026-11-19"}}}}]}}' }));
+  const { service, store, user } = fx;
+  const owner = store.createUser('export-owner', 'FixturePassword!234', 'user');
+  const another = store.createUser('export-other', 'FixturePassword!234', 'user');
+  const templateId = service.saveDraft(user, stringify({
+    id: 'funnel-to-export', name: 'Воронка для выгрузки', folder: 'До перемещения', available: true,
+    connectionId: 'wildberries', endpointId: 'marketplace', method: 'POST', path: FUNNEL_PATH,
+    response: { rows: 'data.products' },
+  }));
+  service.publish(user, templateId);
+  service.saveDraft(user, stringify({ ...store.template(templateId).draft, folder: 'Рабочие/Отчёты' }));
+  assert.equal(service.workspace(owner).options.find(item => item.id === templateId).folder, 'Рабочие/Отчёты');
+
+  const processingId = service.saveProcessing(user, { templateId, name: 'По периодам' });
+  const options = { name: 'Карточки', format: 'csv', entries: [{ templateId, processingId }],
+    schedule: { days: [0, 1, 2, 3, 4, 5, 6], time: '09:00' } };
+  const jobId = service.saveJob(owner, options);
+  const keptId = service.saveJob(owner, { ...options, name: 'Другая выгрузка', schedule: null });
+  const runId = service.createRun(owner, { kind: 'job', jobId });
+
+  store.db.exec('ALTER TABLE jobs DROP COLUMN deleted_at');
+  const reopened = new Store(store.root);
+  try {
+    assert.equal(reopened.job(jobId).deleted_at, null);
+    assert.equal(reopened.run(runId).job_id, jobId);
+  } finally {
+    reopened.close();
+  }
+
+  assert.throws(() => service.deleteJob(another, jobId), /недоступна/);
+  const now = Date.now();
+  store.scheduleJob(jobId, now - 86_400_000, now + 1000, now);
+  service.deleteJob(owner, jobId);
+  service.deleteJob(owner, jobId);
+  assert.deepEqual(service.workspace(owner).jobs.map(job => job.id), [keptId]);
+  assert.equal(store.job(jobId).pending_at, null);
+  assert.equal(store.job(jobId).pending_slot, null);
+  assert.throws(() => service.createRun(owner, { kind: 'job', jobId }), /недоступна/);
+  assert.throws(() => service.saveJob(owner, { ...options, id: jobId }), /недоступна/);
+  assert.equal(store.template(templateId).version, 1);
+  assert.equal(store.processing(processingId).templateId, templateId);
+
+  await fx.run(runId);
+  const calls = [];
+  await service.startScheduled(now + 86_400_000, id => calls.push(id));
+  assert.deepEqual(calls, []);
+  assert.equal(service.workspace(owner).runs.length, 1);
+  const run = service.getRun(owner, runId);
+  assert.equal(run.state, 'completed');
+  assert.ok(await fs.stat(run.progress.exportPath));
+});

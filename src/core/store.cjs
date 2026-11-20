@@ -57,7 +57,7 @@ class Store {
       );
       CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, owner TEXT REFERENCES users(id), value TEXT NOT NULL,
-        schedule_cursor INTEGER NOT NULL, pending_at INTEGER, pending_slot INTEGER
+        schedule_cursor INTEGER NOT NULL, pending_at INTEGER, pending_slot INTEGER, deleted_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id), owner TEXT REFERENCES users(id), state TEXT NOT NULL,
@@ -77,6 +77,11 @@ class Store {
         updated INTEGER NOT NULL
       );
     `);
+    this.transaction(() => {
+      if (!this.db.prepare('PRAGMA table_info(jobs)').all().some(column => column.name === 'deleted_at')) {
+        this.db.exec('ALTER TABLE jobs ADD COLUMN deleted_at INTEGER');
+      }
+    });
     if (seed && !this.setting('initialized')) this.seed();
   }
 
@@ -262,7 +267,9 @@ class Store {
   }
 
   jobs(owner = null) {
-    const sql = owner ? 'SELECT * FROM jobs WHERE owner = ? ORDER BY rowid' : 'SELECT * FROM jobs ORDER BY rowid';
+    const sql = owner
+      ? 'SELECT * FROM jobs WHERE deleted_at IS NULL AND owner = ? ORDER BY rowid'
+      : 'SELECT * FROM jobs WHERE deleted_at IS NULL ORDER BY rowid';
     return this.db.prepare(sql).all(...(owner ? [owner] : [])).map(row => decode(row, ['value']));
   }
 
@@ -270,18 +277,24 @@ class Store {
     return decode(this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id), ['value']);
   }
 
+  deleteJob(id) {
+    this.db.prepare('UPDATE jobs SET deleted_at = ?, pending_at = NULL, pending_slot = NULL WHERE id = ? AND deleted_at IS NULL')
+      .run(Date.now(), id);
+  }
+
   putJob(job, owner, unchangedSchedule, now = Date.now()) {
-    this.db.prepare(`
+    return this.db.prepare(`
       INSERT INTO jobs (id, owner, value, schedule_cursor) VALUES (?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET value = excluded.value,
         schedule_cursor = CASE WHEN ? THEN jobs.schedule_cursor ELSE excluded.schedule_cursor END,
         pending_at = CASE WHEN ? THEN jobs.pending_at ELSE NULL END,
         pending_slot = CASE WHEN ? THEN jobs.pending_slot ELSE NULL END
+      WHERE jobs.deleted_at IS NULL
     `).run(job.id, owner, stringify(job), now, Number(unchangedSchedule), Number(unchangedSchedule), Number(unchangedSchedule));
   }
 
   scheduleJob(id, cursor, pendingAt, pendingSlot) {
-    this.db.prepare('UPDATE jobs SET schedule_cursor = ?, pending_at = ?, pending_slot = ? WHERE id = ?')
+    this.db.prepare('UPDATE jobs SET schedule_cursor = ?, pending_at = ?, pending_slot = ? WHERE id = ? AND deleted_at IS NULL')
       .run(cursor, pendingAt, pendingSlot, id);
   }
 

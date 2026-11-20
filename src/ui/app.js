@@ -236,7 +236,7 @@ function render() {
   root.replaceChildren(h('div', { class: 'layout' }, sidebar, appBody));
 }
 
-function groupFolders(items, folders, pathFor, renderItems) {
+function folderTree(items, folders, pathFor) {
   const tree = { items: [], children: new Map() };
   const add = folderPath => folderPath.split('/').filter(Boolean).reduce((node, name) => {
     if (!node.children.has(name)) node.children.set(name, { items: [], children: new Map() });
@@ -244,6 +244,11 @@ function groupFolders(items, folders, pathFor, renderItems) {
   }, tree);
   for (const folder of folders) add(folder.path);
   for (const item of items) add(pathFor(item)).items.push(item);
+  return tree;
+}
+
+function groupFolders(items, folders, pathFor, renderItems) {
+  const tree = folderTree(items, folders, pathFor);
   const draw = node => [
     node.items.length > 0 && renderItems(node.items),
     [...node.children].map(([name, child]) => h('details', { class: 'folder', open: true },
@@ -267,6 +272,8 @@ function scheduleLabel(value) {
 
 function jobPage(workspace) {
   const { jobs, runs, folders, options } = workspace;
+  const jobIds = new Set(jobs.map(job => job.id));
+  const shownRuns = runs.filter(run => !run.job_id || jobIds.has(run.job_id));
   const jobsTable = entries => table(['Выгрузка', 'Расписание', 'Статус', 'Действия'], entries.map(job => {
     const last = runs.find(run => run.job_id === job.id);
     return h('tr', {},
@@ -277,6 +284,7 @@ function jobPage(workspace) {
       h('td', {}, cluster(
         btn('Запустить', () => start({ kind: 'job', jobId: job.id }), 'primary compact', job.active || workspace.quitting),
         btn('Изменить', () => jobEditor(job.value), 'compact'),
+        btn('Удалить', () => deleteJobDialog(job), 'danger compact'),
       )));
   }));
   return [
@@ -284,7 +292,7 @@ function jobPage(workspace) {
       cluster(btn('Новая папка', () => createFolder('job')), btn('Создать выгрузку', () => jobEditor(), 'primary', !options.length))),
     h('div', { class: 'metrics' }, [
       ['Сохранено', jobs.length],
-      ['В работе', runs.filter(run => active.has(run.state)).length],
+      ['В работе', shownRuns.filter(run => active.has(run.state)).length],
       ['С расписанием', jobs.filter(job => job.value.schedule).length],
     ].map(([label, value]) => h('div', { class: 'metric' }, h('small', {}, label), h('strong', {}, number.format(value))))),
     stack(
@@ -292,9 +300,20 @@ function jobPage(workspace) {
         ? groupFolders(jobs, folders.filter(item => item.kind === 'job'), job => job.value.folder, jobsTable)
         : h('div', { class: 'empty' }, options.length ? 'Создайте выгрузку и выберите источники данных.' : 'Настройщик ещё не открыл доступ к шаблонам.')),
       section('Последние запуски', btn('Журнал', () => { state.page = 'logs'; render(); }, 'ghost compact'),
-        runs.length ? runsTable(runs.slice(0, 12)) : h('div', { class: 'empty' }, 'Здесь появится история запусков.')),
+        shownRuns.length ? runsTable(shownRuns.slice(0, 12)) : h('div', { class: 'empty' }, 'Здесь появится история запусков.')),
     ),
   ];
+}
+
+function deleteJobDialog(job) {
+  formModal('Удалить выгрузку', [
+    h('p', {}, `Удалить «${job.value.name}» из списка выгрузок?`),
+    job.value.schedule && h('p', { class: 'caption' }, 'Новые запуски по её расписанию прекратятся.'),
+    h('p', { class: 'caption' }, 'Историю и файлы запусков можно открыть в журнале.'),
+  ], 'Удалить', async () => {
+    await call('deleteJob', { jobId: job.id });
+    await done('Выгрузка удалена.');
+  });
 }
 
 function runsTable(runs) {
@@ -495,8 +514,54 @@ function dictionaryPicker(templateId, param, draft, pick) {
   return element;
 }
 
+function jobTemplatePicker(options, folders, initial, onSelect) {
+  const connections = new Map(options.map(option => [option.connectionId, option.connection]));
+  const connection = select([['', 'Выберите подключение'], ...connections], initial?.connectionId ?? '');
+  const browser = stack();
+  let chosen = initial;
+  let path = initial?.folder ? initial.folder.split('/') : [];
+  function navigate(nextPath) {
+    path = nextPath;
+    draw();
+  }
+  function draw() {
+    if (!connection.value) { browser.replaceChildren(); return; }
+    const tree = folderTree(options.filter(option => option.connectionId === connection.value),
+      folders.filter(folder => folder.kind === 'template' && folder.scope === connection.value), option => option.folder);
+    const current = path.reduce((node, name) => node.children.get(name), tree);
+    const breadcrumbs = h('nav', { class: 'cluster', 'aria-label': 'Текущая папка' },
+      path.length ? btn('Корневая папка', () => navigate([]), 'ghost compact') : h('strong', {}, 'Корневая папка'),
+      path.map((part, index) => [
+        h('span', { 'aria-hidden': 'true' }, '›'),
+        index === path.length - 1 ? h('strong', { 'aria-current': 'location' }, part)
+          : btn(part, () => navigate(path.slice(0, index + 1)), 'ghost compact'),
+      ]));
+    const entries = [...current.children.keys()].map(name => btn(`${name} ›`, () => navigate([...path, name]), 'compact'));
+    const selectedHere = current.items.some(item => item.id === chosen?.id);
+    const templates = select([['', 'Выберите шаблон', true], ...current.items.map(option => [option.id, option.name])],
+      selectedHere ? chosen.id : '', event => {
+        chosen = current.items.find(item => item.id === event.target.value);
+        onSelect(chosen);
+        browser.querySelector('[data-selected-template]')?.remove();
+      });
+    browser.replaceChildren(stack(
+      breadcrumbs,
+      entries.length > 0 && h('nav', { class: 'cluster', 'aria-label': 'Подпапки шаблонов' }, entries),
+      current.items.length ? field('Шаблон запроса', templates) : h('p', { class: 'caption' }, 'В этой папке нет доступных шаблонов.'),
+      chosen && !selectedHere && h('small', { class: 'caption', 'data-selected-template': true }, `Выбран шаблон «${chosen.name}»`),
+    ));
+  }
+  connection.addEventListener('change', () => {
+    chosen = undefined;
+    onSelect();
+    navigate([]);
+  });
+  draw();
+  return stack(field('Подключение', connection), browser);
+}
+
 function jobEditor(job) {
-  const { options, processings } = state.workspace;
+  const { options, processings, folders } = state.workspace;
   const name = input(job?.name, { required: true, maxlength: 160 });
   const folder = input(job?.folder, { maxlength: 250, placeholder: 'Рабочие / Заказы' });
   const format = select([['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV']], job?.format ?? 'xlsx');
@@ -509,16 +574,16 @@ function jobEditor(job) {
   const sourceList = stack();
   const sources = [];
   function add(entry) {
-    const selected = select(options.map(option => [option.id, `${option.connection} · ${option.name}`]), entry?.templateId);
+    const initial = options.find(option => option.id === entry?.templateId);
     const settings = stack();
     const item = {};
     const card = h('div', { class: 'source-card' },
       cluster(h('h3', {}, 'Источник'), btn('Убрать', () => { sources.splice(sources.indexOf(item), 1); card.remove(); }, 'compact ghost')),
-      field('Шаблон запроса', selected), settings);
-    function bind(previous) {
-      const template = options.find(option => option.id === selected.value);
+      jobTemplatePicker(options, folders, initial, template => bind(template)), settings);
+    function bind(template, previous) {
       if (!template) {
-        settings.replaceChildren(h('p', { class: 'notice error' }, 'Шаблон недоступен. Выберите другой источник.'));
+        settings.replaceChildren();
+        if (previous) settings.append(h('p', { class: 'notice error' }, 'Шаблон недоступен. Выберите другой источник.'));
         item.value = () => { throw new Error('Выберите доступный шаблон.'); };
         return;
       }
@@ -535,8 +600,7 @@ function jobEditor(job) {
       item.value = () => ({ templateId: template.id, environment: env.value, values: params.value(),
         processingId: processing.value || undefined });
     }
-    selected.addEventListener('change', () => bind());
-    bind(entry);
+    bind(initial, entry);
     sources.push(item);
     sourceList.append(card);
   }
