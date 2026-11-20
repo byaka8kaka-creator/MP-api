@@ -4,7 +4,7 @@ const path = require('node:path');
 const { InputError, object, publicValue, readJson, stringify } = require('./json.cjs');
 const { demand, folder, id, inputValues, profileFor, text, validateConnection, validateTemplate } = require('./model.cjs');
 const { generalLog, logEvent, logTail, preview, referenceValues, runLog, sample } = require('./datasets.cjs');
-const { processingDefaults, processingType, validateProcessing } = require('./processings.cjs');
+const { processingDefaults, processingSteps, validateProcessing } = require('./processings.cjs');
 const { scheduleDecision, validateSchedule } = require('./schedule.cjs');
 
 function canConfigure(user) {
@@ -14,6 +14,8 @@ function canConfigure(user) {
 function safeToSee(user, owner) {
   return user.role === 'admin' || user.id === owner;
 }
+
+const activeStates = new Set(['queued', 'running', 'waiting']);
 
 function formTemplate(template, version) {
   return {
@@ -44,6 +46,25 @@ function validateGraph(proposed, templates) {
   visit(proposed);
 }
 
+function templateDependents(templates, templateId, includeDrafts = false) {
+  const byReference = new Map();
+  for (const template of templates) {
+    for (const version of includeDrafts ? [template.published, template.draft] : [template.published]) {
+      for (const { reference } of version?.parameters ?? []) {
+        if (!reference) continue;
+        const dependents = byReference.get(reference.templateId) ?? new Set();
+        dependents.add(template.id);
+        byReference.set(reference.templateId, dependents);
+      }
+    }
+  }
+  const affected = new Set([templateId]);
+  for (const id of affected) {
+    for (const dependent of byReference.get(id) ?? []) affected.add(dependent);
+  }
+  return affected;
+}
+
 class Service {
   constructor(store, vault) {
     this.store = store;
@@ -69,13 +90,17 @@ class Service {
         if (record.draft.connectionId === option.connectionId) option.folder = record.draft.folder;
         const connection = connections.find(item => item.id === option.connectionId);
         const endpoint = connection?.endpoints.find(item => item.id === record.published.endpointId);
-        return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), processingType: processingType(record.published) };
+        return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), archived: Boolean(record.archived_at),
+          processingDefaults: editor ? processingDefaults(record.published) : undefined };
       }),
-      processings: store.processings().filter(item => visibleIds.has(item.templateId)),
-      processingDefaults: editor ? processingDefaults : null,
+      processings: store.processings().filter(item => visibleIds.has(item.templateId)).map(item => {
+        const steps = processingSteps(item);
+        return { ...item, steps: publicValue(steps), recipeJson: stringify({ steps, columns: item.columns }, null, 2) };
+      }),
       connections: editor ? connections : [],
       templates: editor ? all.map(item => ({
         id: item.id, version: item.version, draft: publicValue(item.draft), draftJson: stringify(item.draft, null, 2),
+        archived: Boolean(item.archived_at),
         published: item.published && publicValue(item.published), sampleRunId: item.sample_run_id,
         dictionary: store.dictionary(item.id) ?? null,
       })) : [],
@@ -95,12 +120,14 @@ class Service {
 
   saveProcessing(user, value) {
     demand(canConfigure(user), 'Обработки редактирует настройщик.');
+    demand(object(value), 'Укажите настройки обработки.');
     const processingId = value.id ? id(value.id) : randomUUID();
     const previous = this.store.processing(processingId);
     const templateId = id(value.templateId);
     demand(!previous || previous.templateId === templateId, 'Создайте отдельную обработку для другого шаблона.');
-    const template = this.store.template(templateId)?.published;
-    const processing = validateProcessing({ ...value, id: processingId, type: previous?.type }, template);
+    const record = this.store.template(templateId);
+    demand(previous || !record?.archived_at, 'Восстановите шаблон для создания обработки.');
+    const processing = validateProcessing({ ...value, id: processingId, type: previous?.type }, record?.published);
     this.store.putProcessing(processing);
     return processingId;
   }
@@ -112,12 +139,49 @@ class Service {
     return validateProcessing(config, template);
   }
 
+  deleteProcessing(user, processingId) {
+    demand(canConfigure(user), 'Обработки редактирует настройщик.');
+    const config = this.store.processing(id(processingId));
+    demand(config, 'Обработка отсутствует.');
+    const jobs = this.store.jobs().filter(job => job.value.entries.some(entry => entry.processingId === processingId));
+    demand(!jobs.length, `Уберите обработку из выгрузок перед удалением. ${jobs.map(job => job.value.name).join(', ')}`);
+    this.store.removeProcessing(processingId);
+  }
+
   processingFromRun(user, run, value) {
     const index = value.source;
     demand(Number.isInteger(index) && run.snapshot.sources[index], 'Выберите источник данных.');
     const progress = run.progress.sources?.[index];
     demand(progress?.rows > 0 || progress?.state === 'completed', 'В этом источнике нет сохранённых строк.');
     return { sourceIndex: index, processing: this.processingFor(user, value.processingId, run.snapshot.sources[index].template) };
+  }
+
+  processingRuns(user, templateId) {
+    demand(canConfigure(user), 'Настройка обработки доступна настройщику.');
+    id(templateId);
+    return this.store.runs(user.role === 'admin' ? null : user.id).flatMap(summary => {
+      if (activeStates.has(summary.state)) return [];
+      const run = this.store.run(summary.id);
+      if (!run) return [];
+      return run.snapshot.sources.flatMap((source, index) => {
+        const progress = run.progress.sources?.[index];
+        return source.template.id === templateId && (progress?.rows > 0 || progress?.state === 'completed')
+          ? [{ runId: run.id, source: index, name: summary.name, created: summary.created, rows: progress.rows }]
+          : [];
+      });
+    });
+  }
+
+  processingPreview(user, value) {
+    demand(canConfigure(user), 'Настройка обработки доступна настройщику.');
+    const run = this.getRun(user, value.runId);
+    demand(!activeStates.has(run.state), 'Дождитесь завершения запуска.');
+    const index = value.source;
+    demand(Number.isInteger(index) && run.snapshot.sources[index], 'Выберите сохранённый источник.');
+    const progress = run.progress.sources?.[index];
+    demand(progress?.rows > 0 || progress?.state === 'completed', 'У источника нет готовых данных.');
+    const processing = validateProcessing({ ...value, id: value.id ?? randomUUID() }, run.snapshot.sources[index].template);
+    return { runId: run.id, sourceIndex: index, processing };
   }
 
   saveConnection(user, raw) {
@@ -175,6 +239,7 @@ class Service {
     demand(canConfigure(user), 'Шаблоны редактирует настройщик.');
     const value = readJson(raw, 'Черновик');
     demand(object(value), 'Черновик должен быть объектом.');
+    if (value.id) demand(!this.store.template(id(value.id))?.archived_at, 'Восстановите шаблон для редактирования.');
     const connection = this.store.connection(id(value.connectionId));
     const template = validateTemplate({ ...value, id: value.id || randomUUID() }, connection);
     const graph = new Map(this.store.templates().map(item => [item.id, item.published ?? item.draft]));
@@ -188,6 +253,7 @@ class Service {
     demand(canConfigure(user), 'Версии публикует настройщик.');
     const record = this.store.template(id(templateId));
     demand(record, 'Черновик отсутствует.');
+    demand(!record.archived_at, 'Восстановите шаблон для публикации.');
     const draft = validateTemplate(record.draft, this.store.connection(record.draft.connectionId));
     const published = new Map(this.store.templates().filter(item => item.published).map(item => [item.id, item.published]));
     published.set(draft.id, draft);
@@ -195,9 +261,46 @@ class Service {
     return this.store.transaction(() => this.store.publish(draft.id));
   }
 
+  templateUsage(user, templateId) {
+    demand(canConfigure(user), 'Управление шаблонами доступно настройщику.');
+    demand(this.store.template(id(templateId)), 'Шаблон отсутствует.');
+    const records = this.store.templates();
+    const published = templateDependents(records, templateId);
+    const affected = templateDependents(records, templateId, true);
+    return {
+      jobs: this.store.jobs().filter(job => job.value.entries.some(entry => published.has(entry.templateId)))
+        .map(job => ({ name: job.value.name, folder: job.value.folder,
+          indirect: !job.value.entries.some(entry => entry.templateId === templateId) })),
+      processings: this.store.processings().filter(processing => published.has(processing.templateId))
+        .map(processing => ({ name: processing.name, indirect: processing.templateId !== templateId })),
+      templates: records.filter(record => record.id !== templateId && affected.has(record.id))
+        .map(record => ({ name: record.draft.name, folder: record.draft.folder,
+          connection: this.store.connection(record.draft.connectionId)?.name,
+          draftOnly: !published.has(record.id) })),
+      runs: this.store.activeRuns().map(active => this.store.run(active.id))
+        .filter(run => run?.snapshot.sources.some(source => source.template.id === templateId))
+        .map(run => ({ name: run.name })),
+    };
+  }
+
+  archiveTemplate(user, templateId, archived) {
+    demand(canConfigure(user), 'Управление шаблонами доступно настройщику.');
+    demand(this.store.template(id(templateId)) && typeof archived === 'boolean', 'Выберите шаблон и действие.');
+    this.store.archiveTemplate(templateId, archived);
+  }
+
+  deleteTemplate(user, templateId) {
+    this.store.transaction(() => {
+      const usage = this.templateUsage(user, templateId);
+      demand(Object.values(usage).every(list => list.length === 0), 'Шаблон используется. Откройте «Где используется» или отправьте его в архив.');
+      this.store.removeTemplate(templateId);
+    });
+  }
+
   pack(user, selection) {
     demand(canConfigure(user), 'Пакеты шаблонов экспортирует настройщик.');
-    const templates = new Map(this.store.templates().map(item => [item.id, item.published ?? item.draft]));
+    const records = this.store.templates();
+    const templates = new Map(records.map(item => [item.id, item.published ?? item.draft]));
     const list = new Map();
     function add(template) {
       if (list.has(template.id)) return;
@@ -215,7 +318,10 @@ class Service {
       const connectionId = id(selection.connectionId);
       demand(this.store.connection(connectionId), 'Подключение отсутствует.');
       connectionIds.add(connectionId);
-      for (const item of templates.values()) if (item.connectionId === connectionId) add(item);
+      for (const record of records) {
+        const template = templates.get(record.id);
+        if (!record.archived_at && template.connectionId === connectionId) add(template);
+      }
     }
     for (const template of list.values()) connectionIds.add(template.connectionId);
     return stringify({
@@ -322,8 +428,17 @@ class Service {
     demand(!existing || (existing.deleted_at === null && safeToSee(user, existing.owner)), 'Выгрузка недоступна.');
     const owner = existing ? this.store.user(existing.owner) : user;
     demand(Array.isArray(value.entries) && value.entries.length > 0 && value.entries.length <= 30, 'Выберите от 1 до 30 источников.');
+    const previousEntries = new Map();
+    for (const entry of existing?.value.entries ?? []) {
+      previousEntries.set(entry.templateId, (previousEntries.get(entry.templateId) ?? 0) + 1);
+    }
     const entries = value.entries.map(item => {
       const entry = { templateId: id(item.templateId), environment: item.environment ?? 'production', values: item.values ?? '{}' };
+      if (this.store.template(entry.templateId)?.archived_at) {
+        const count = previousEntries.get(entry.templateId) ?? 0;
+        demand(count > 0, 'Восстановите шаблон для добавления нового источника.');
+        previousEntries.set(entry.templateId, count - 1);
+      }
       if (item.processingId) entry.processingId = id(item.processingId);
       return entry;
     });
@@ -386,7 +501,7 @@ class Service {
         }
         return {
           name: source.template.name, version: source.version, environment: source.environment,
-          templateId: source.template.id, processingName: source.processing?.name, processingType: processingType(source.template),
+          templateId: source.template.id, processingName: source.processing?.name,
           isDependency: Boolean(source.isDependency), values: stringify(values, null, 2),
         };
       }),

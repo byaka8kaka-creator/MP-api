@@ -2,7 +2,8 @@ const { net } = require('electron');
 const { Store } = require('./core/store.cjs');
 const { LimitScheduler } = require('./core/limits.cjs');
 const { executeRun, problem } = require('./core/runner.cjs');
-const { exportRun, prune } = require('./core/datasets.cjs');
+const { exportRun, previewProcessing, prune } = require('./core/datasets.cjs');
+const { parseJson } = require('./core/json.cjs');
 
 const root = process.argv.at(-1);
 const port = process.parentPort;
@@ -21,10 +22,16 @@ port.on('message', async ({ data }) => {
     await prune(store).catch(() => port.postMessage({ event: 'maintenance-error' }));
     return;
   }
-  if (action === 'export') {
+  if (action === 'export' || action === 'processingPreview') {
     try {
-      const { processing, sourceIndex } = data;
-      const output = await exportRun(store, store.run(runId), data.format, { processing, sourceIndex });
+      const { processingJson, sourceIndex } = data;
+      const processing = processingJson ? parseJson(processingJson) : null;
+      if (action === 'processingPreview') {
+        const value = await previewProcessing(store, store.run(runId), sourceIndex, processing);
+        port.postMessage({ event: 'result', requestId, value });
+        return;
+      }
+      const output = await exportRun(store, store.run(runId), data.format, { processing: processing ?? undefined, sourceIndex });
       const latest = store.run(runId);
       if (processing) {
         latest.progress.processingExports ??= {};
@@ -36,9 +43,9 @@ port.on('message', async ({ data }) => {
         delete latest.progress.exportError;
       }
       store.updateRun(runId, latest.state, latest.progress);
-      port.postMessage({ event: 'exported', requestId });
+      port.postMessage({ event: 'result', requestId });
     } catch (error) {
-      port.postMessage({ event: 'exported', requestId, error: problem(error) });
+      port.postMessage({ event: 'result', requestId, error: problem(error) });
     }
     return;
   }

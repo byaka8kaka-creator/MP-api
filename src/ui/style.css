@@ -170,6 +170,14 @@ textarea { resize: vertical; }
 textarea.code { font: 12px/1.55 'Cascadia Code', Consolas, monospace; background: #f8faf8; tab-size: 2; }
 .source-card { border: 1px solid var(--line); border-radius: 10px; background: #fbfdfb; padding: 13px; display: grid; gap: 12px; }
 .source-card > .cluster { justify-content: space-between; }
+.recipe-list { display: grid; gap: 9px; }
+.recipe-item { display: grid; gap: 8px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.recipe-item-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.recipe-step { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+.recipe-step summary { padding: 5px 0; cursor: pointer; font-weight: 640; }
+.recipe-step details[open] > summary { margin-bottom: 8px; }
+.recipe-add { display: flex; gap: 8px; align-items: end; }
+.recipe-columns .recipe-list { max-height: 365px; overflow: auto; }
 .fold { padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdfb; }
 .fold > summary { cursor: pointer; font-weight: 620; }
 .fold > summary:not(:last-child) { margin-bottom: 7px; }

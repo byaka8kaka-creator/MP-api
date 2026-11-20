@@ -160,7 +160,7 @@ async function refresh(force = false) {
       state.workspace = workspace;
       state.refreshKey = key;
       state.user = workspace.user;
-      if (state.user.role === 'user' && state.page === 'api') state.page = 'jobs';
+      if (state.user.role === 'user' && ['api', 'templates'].includes(state.page)) state.page = 'jobs';
       render();
     }
   } finally {
@@ -218,10 +218,12 @@ async function logout() {
 function render() {
   if (!state.user || state.user.must_change || !state.workspace) { root.replaceChildren(loginPage()); return; }
   const workspace = state.workspace;
-  const nav = [['jobs', 'Выгрузки'], ['api', 'API-запросы'], ['processings', 'Обработки'], ['logs', 'Журнал'], ['settings', 'Настройки']];
-  const route = { jobs: jobPage, api: apiPage, processings: processingPage, logs: logPage, settings: settingsPage };
+  const nav = [['jobs', 'Выгрузки'], ['api', 'Подключения'], ['templates', 'Шаблоны запросов'],
+    ['processings', 'Обработки'], ['logs', 'Журнал'], ['settings', 'Настройки']];
+  const route = { jobs: jobPage, api: apiPage, templates: templatePage, processings: processingPage, logs: logPage, settings: settingsPage };
   const sidebar = h('aside', { class: 'sidebar' }, brand(),
-    h('nav', { class: 'navigation', 'aria-label': 'Разделы' }, nav.filter(([id]) => id !== 'api' || state.user.role !== 'user').map(([id, label]) =>
+    h('nav', { class: 'navigation', 'aria-label': 'Разделы' }, nav.filter(([id]) =>
+      state.user.role !== 'user' || !['api', 'templates'].includes(id)).map(([id, label]) =>
       h('button', { type: 'button', 'aria-current': state.page === id ? 'page' : undefined, onclick: () => {
         state.page = id;
         render();
@@ -272,6 +274,7 @@ function scheduleLabel(value) {
 
 function jobPage(workspace) {
   const { jobs, runs, folders, options } = workspace;
+  const hasTemplates = options.some(option => !option.archived);
   const jobIds = new Set(jobs.map(job => job.id));
   const shownRuns = runs.filter(run => !run.job_id || jobIds.has(run.job_id));
   const jobsTable = entries => table(['Выгрузка', 'Расписание', 'Статус', 'Действия'], entries.map(job => {
@@ -289,7 +292,7 @@ function jobPage(workspace) {
   }));
   return [
     header('Выгрузки', 'Запускайте сохранённые наборы запросов и получайте результаты в XLSX или CSV.',
-      cluster(btn('Новая папка', () => createFolder('job')), btn('Создать выгрузку', () => jobEditor(), 'primary', !options.length))),
+      cluster(btn('Новая папка', () => createFolder('job')), btn('Создать выгрузку', () => jobEditor(), 'primary', !hasTemplates))),
     h('div', { class: 'metrics' }, [
       ['Сохранено', jobs.length],
       ['В работе', shownRuns.filter(run => active.has(run.state)).length],
@@ -298,7 +301,7 @@ function jobPage(workspace) {
     stack(
       section('Мои выгрузки', null, jobs.length || folders.some(item => item.kind === 'job')
         ? groupFolders(jobs, folders.filter(item => item.kind === 'job'), job => job.value.folder, jobsTable)
-        : h('div', { class: 'empty' }, options.length ? 'Создайте выгрузку и выберите источники данных.' : 'Настройщик ещё не открыл доступ к шаблонам.')),
+        : h('div', { class: 'empty' }, hasTemplates ? 'Создайте выгрузку и выберите источники данных.' : 'Настройщик ещё не открыл доступ к шаблонам.')),
       section('Последние запуски', btn('Журнал', () => { state.page = 'logs'; render(); }, 'ghost compact'),
         shownRuns.length ? runsTable(shownRuns.slice(0, 12)) : h('div', { class: 'empty' }, 'Здесь появится история запусков.')),
     ),
@@ -538,7 +541,8 @@ function jobTemplatePicker(options, folders, initial, onSelect) {
       ]));
     const entries = [...current.children.keys()].map(name => btn(`${name} ›`, () => navigate([...path, name]), 'compact'));
     const selectedHere = current.items.some(item => item.id === chosen?.id);
-    const templates = select([['', 'Выберите шаблон', true], ...current.items.map(option => [option.id, option.name])],
+    const templates = select([['', 'Выберите шаблон', true], ...current.items.map(option =>
+      [option.id, option.archived ? `${option.name} (архив)` : option.name])],
       selectedHere ? chosen.id : '', event => {
         chosen = current.items.find(item => item.id === event.target.value);
         onSelect(chosen);
@@ -579,7 +583,8 @@ function jobEditor(job) {
     const item = {};
     const card = h('div', { class: 'source-card' },
       cluster(h('h3', {}, 'Источник'), btn('Убрать', () => { sources.splice(sources.indexOf(item), 1); card.remove(); }, 'compact ghost')),
-      jobTemplatePicker(options, folders, initial, template => bind(template)), settings);
+      jobTemplatePicker(options.filter(option => !option.archived || option.id === initial?.id),
+        folders, initial, template => bind(template)), settings);
     function bind(template, previous) {
       if (!template) {
         settings.replaceChildren();
@@ -589,7 +594,7 @@ function jobEditor(job) {
       }
       const env = select([['production', 'Рабочая'], ['sandbox', 'Песочница', !template.sandbox]], previous?.environment ?? 'production');
       const params = parameterValues(template, previous?.values);
-      const available = processings.filter(item => item.templateId === template.id && item.type === template.processingType);
+      const available = processings.filter(item => item.templateId === template.id);
       const modes = [['', 'Без обработки'], ...available.map(item => [item.id, item.name])];
       if (previous?.processingId && !available.some(item => item.id === previous.processingId)) {
         modes.push([previous.processingId, 'Сохранённая обработка недоступна', true]);
@@ -620,101 +625,139 @@ function jobEditor(job) {
 
 function processingPage(workspace) {
   const editor = state.user.role !== 'user';
-  const supported = workspace.options.some(option => option.processingType);
+  const supported = workspace.options.some(option => !option.archived);
   return [
     header('Обработки', 'Подготовьте данные для Excel или CSV. Обработку можно добавить в новую выгрузку или применить к результату в журнале.',
       editor && btn('Новая обработка', () => processingEditor(), 'primary', !supported)),
     section('Сохранённые обработки', null,
       workspace.processings.length
-        ? table(['Обработка', 'Шаблон запроса', 'Колонки', 'Действия'], workspace.processings.map(processing => {
+        ? table(['Обработка', 'Шаблон запроса', 'Шаги', 'Действия'], workspace.processings.map(processing => {
           const template = workspace.options.find(option => option.id === processing.templateId);
           return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, processing.name)),
           h('td', {}, template?.name),
-          h('td', {}, number.format(processing.columns.length)),
+          h('td', {}, number.format(processing.steps.length + 1)),
           h('td', {}, cluster(editor && btn('Изменить', () => processingEditor(processing), 'compact'),
+            editor && btn('Удалить', () => formModal('Удалить обработку', h('p', {}, processing.name), 'Удалить', async () => {
+              await call('deleteProcessing', { processingId: processing.id });
+              await done('Обработка удалена.');
+            }), 'compact danger'),
             btn('История запусков', () => { state.page = 'logs'; render(); }, 'compact'))));
         }))
         : h('div', { class: 'empty' }, editor && !supported
-          ? 'Опубликуйте шаблон воронки или статистики поисковых кластеров Wildberries.'
+          ? 'Опубликуйте шаблон запроса, чтобы создать обработку.'
           : 'Сохранённых обработок пока нет.')),
   ];
 }
 
-function processingEditor(saved) {
-  const { options, processingDefaults } = state.workspace;
-  const choices = options.filter(item => item.processingType || item.id === saved?.templateId);
-  const template = select(choices.map(item => [item.id, item.name]), saved?.templateId);
-  template.disabled = Boolean(saved);
-  const selectedDefaults = () => processingDefaults[saved?.type ?? choices.find(item => item.id === template.value)?.processingType];
-  let defaults = selectedDefaults();
-  const name = input(saved?.name ?? defaults.name, { required: true, maxlength: 160 });
-  const columns = textarea(pretty(saved?.columns ?? defaults.columns), 11, 'Колонки результата');
-  const description = h('p', { class: 'caption' }, defaults.description);
-  template.addEventListener('change', () => {
-    const next = selectedDefaults();
-    if (next === defaults) return;
-    if (!name.value.trim() || name.value === defaults.name) name.value = next.name;
-    columns.value = pretty(next.columns);
-    description.textContent = next.description;
-    defaults = next;
-  });
-  formModal(saved ? 'Изменить обработку' : 'Новая обработка', [
-    fields(field('Название', name), field('Шаблон запроса', template)),
-    description,
-    h('details', { class: 'fold' }, h('summary', {}, 'Колонки результата'), columns),
-  ], 'Сохранить', async () => {
-    await call('processing', { id: saved?.id, templateId: template.value, name: name.value,
-      columns: editedJson(columns.value, 'Колонки результата') });
-    await done('Обработка сохранена.');
-  });
-}
-
-function apiPage(workspace) {
-  const { connections, templates, folders } = workspace;
+function selectConnection(connections) {
   const selected = connections.find(connection => connection.id === state.connectionId) ?? connections[0];
   state.connectionId = selected?.id;
-  const records = templates.filter(record => record.draft.connectionId === selected?.id);
+  return selected;
+}
+
+function connectionMenu(connections, selected) {
+  return h('div', { class: 'card connections' }, connections.map(connection =>
+    h('button', { type: 'button', class: 'connection-choice', 'aria-pressed': String(connection.id === selected?.id), onclick: () => {
+      state.connectionId = connection.id;
+      render();
+    } }, connection.name)));
+}
+
+function apiPage({ connections }) {
+  const selected = selectConnection(connections);
+  return [
+    header('Подключения', 'Адреса API, ключи и общие лимиты.', btn('Новое подключение', () => connectionEditor(), 'primary')),
+    h('div', { class: 'split' }, connectionMenu(connections, selected), selected &&
+      section(selected.name, cluster(btn('Авторизация', () => credentialsEditor(selected), 'compact', !selected.profiles.length),
+        btn('Подключение', () => connectionEditor(selected), 'compact'),
+        btn('Открыть шаблоны', () => { state.page = 'templates'; render(); }, 'compact')),
+      h('div', { class: 'card-body stack' }, selected.endpoints.map(endpoint =>
+        h('div', {}, h('strong', {}, endpoint.name), h('div', { class: 'mono' }, endpoint.url),
+          endpoint.sandbox && h('div', { class: 'mono caption' }, 'Песочница · ', endpoint.sandbox)))))),
+  ];
+}
+
+function templatePage({ connections, templates, folders }) {
+  const selected = selectConnection(connections);
+  const archived = Boolean(state.showArchivedTemplates);
+  const records = templates.filter(record => record.draft.connectionId === selected?.id && record.archived === archived);
   const entries = list => list.map(record => h('div', { class: 'template-entry' },
     h('div', {}, h('h3', {}, record.draft.name),
       h('p', { class: 'mono' }, h('span', { class: 'tag' }, record.draft.method), ' ', record.draft.path),
       h('small', { class: 'caption' }, record.version ? `Версия ${record.version}` : 'Черновик'),
       record.dictionary && h('small', { class: 'caption' }, ` · Справочник обновлён ${time(record.dictionary.updated)}`)),
     cluster(
-      btn('Настроить', () => templateEditor(selected, record), 'compact'),
-      btn('Тест', () => singleRun(record, 'test'), 'compact'),
+      record.archived ? btn('Восстановить', () => archiveTemplate(record, false), 'compact')
+        : btn('Настроить', () => templateEditor(selected, record), 'compact'),
+      !record.archived && btn('Тест', () => singleRun(record, 'test'), 'compact'),
+      btn('Где используется', () => templateUsageDialog(record), 'compact'),
       h('details', { class: 'fold' }, h('summary', {}, 'Ещё'),
         cluster(
           btn('Образец ответа', () => showSample(record.id), 'compact', !record.sampleRunId),
           btn('Версии', () => showVersions(record.id), 'compact', !record.version),
-          btn('Обновить справочник', () => singleRun(record, 'dictionary'), 'compact', !record.version),
+          !record.archived && btn('Обновить справочник', () => singleRun(record, 'dictionary'), 'compact', !record.version),
           btn('Экспорт шаблона', () => call('pack', { templateId: record.id }), 'compact'),
+          !record.archived && btn('Архивировать', () => archiveTemplate(record, true), 'compact'),
+          btn('Удалить', () => templateUsageDialog(record, true), 'compact danger'),
         )),
     )));
-  const picker = h('div', { class: 'card connections' }, connections.map(connection =>
-    h('button', { type: 'button', class: 'connection-choice', 'aria-pressed': String(connection.id === selected?.id), onclick: () => {
-      state.connectionId = connection.id;
-      render();
-    } }, connection.name)));
+  const visibleFolders = archived ? [] : folders.filter(item => item.kind === 'template' && item.scope === selected?.id);
   return [
-    header('API-запросы', 'Подключения, адреса и версии шаблонов.',
+    header('Шаблоны запросов', null,
       cluster(btn('Импорт пакета', async () => {
         const result = await call('import');
-        if (result) { await refresh(true); showToast(`Импортировано шаблонов: ${result.templates}.`); }
-      }), btn('Новое подключение', () => connectionEditor(), 'primary'))),
-    h('div', { class: 'split' }, picker, selected && stack(
-      section(selected.name, cluster(btn('Авторизация', () => credentialsEditor(selected), 'compact', !selected.profiles.length),
-        btn('Подключение', () => connectionEditor(selected), 'compact'),
-        btn('Экспорт', () => call('pack', { connectionId: selected.id }), 'compact')),
-      h('div', { class: 'card-body stack' }, selected.endpoints.map(endpoint =>
-        h('div', {}, h('strong', {}, endpoint.name), h('div', { class: 'mono' }, endpoint.url),
-          endpoint.sandbox && h('div', { class: 'mono caption' }, 'Песочница · ', endpoint.sandbox))))),
-      section('Шаблоны', cluster(btn('Папка', () => createFolder('template', selected.id), 'compact'),
-        btn('Новый шаблон', () => templateEditor(selected), 'primary compact')),
-      records.length || folders.some(item => item.kind === 'template' && item.scope === selected.id)
-        ? groupFolders(records, folders.filter(item => item.kind === 'template' && item.scope === selected.id), item => item.draft.folder, entries)
-        : h('div', { class: 'empty' }, 'Создайте шаблон для запроса к этому подключению.')),
-    )),
+        if (result) {
+          state.showArchivedTemplates = false;
+          await refresh(true);
+          showToast(`Импортировано шаблонов: ${result.templates}.`);
+        }
+      }), !archived && btn('Новый шаблон', () => templateEditor(selected), 'primary', !selected))),
+    h('div', { class: 'split' }, connectionMenu(connections, selected), selected &&
+      section(archived ? `Архив · ${selected.name}` : selected.name, cluster(
+        btn(archived ? 'Действующие шаблоны' : 'Архив', () => {
+          state.showArchivedTemplates = !archived;
+          render();
+        }, 'compact'),
+        !archived && btn('Папка', () => createFolder('template', selected.id), 'compact'),
+        !archived && btn('Экспорт', () => call('pack', { connectionId: selected.id }), 'compact')),
+      records.length || visibleFolders.length
+        ? groupFolders(records, visibleFolders, item => item.draft.folder, entries)
+        : h('div', { class: 'empty' }, archived ? 'Архив пуст.' : 'Создайте шаблон для этого подключения.'))),
   ];
+}
+
+async function archiveTemplate(record, archived) {
+  await call('archiveTemplate', { templateId: record.id, archived });
+  if (editor.open) {
+    await done(archived ? 'Шаблон в архиве.' : 'Шаблон восстановлен.');
+  } else {
+    await refresh(true);
+    showToast(archived ? 'Шаблон в архиве.' : 'Шаблон восстановлен.');
+  }
+}
+
+async function templateUsageDialog(record, deleting = false) {
+  const usage = await call('templateUsage', { templateId: record.id });
+  const groups = [['Выгрузки', usage.jobs], ['Обработки', usage.processings],
+    ['Зависимые шаблоны', usage.templates], ['Текущие запуски', usage.runs]];
+  const used = groups.some(([, entries]) => entries.length);
+  modal(deleting ? 'Удалить шаблон' : 'Где используется', [
+    h('h3', {}, record.draft.name),
+    used ? groups.filter(([, entries]) => entries.length).map(([label, entries]) => stack(
+      h('strong', {}, label),
+      h('ul', {}, entries.map(entry => h('li', {},
+        [entry.connection, entry.folder, entry.name].filter(Boolean).join(' / '),
+        entry.indirect && ' · через зависимый запрос',
+        entry.draftOnly && ' · связь в черновике'))),
+    )) : h('p', { class: 'caption' }, 'У шаблона нет действующих ссылок.'),
+    deleting && used && h('p', { class: 'notice' }, 'Для удаления снимите ссылки или перенесите шаблон в архив.'),
+  ], [
+    !record.archived && btn('Архивировать', () => archiveTemplate(record, true)),
+    deleting ? btn('Удалить', async () => {
+      await call('deleteTemplate', { templateId: record.id });
+      await done('Шаблон удалён.');
+    }, 'danger', used) : btn('Удалить…', () => templateUsageDialog(record, true), 'danger'),
+  ]);
 }
 
 function connectionEditor(connection) {
@@ -941,7 +984,7 @@ async function runDetails(runId) {
   const logs = btn('Открыть журнал', () => showLogs({ runId }));
   const results = run.sources.map((source, index) => {
     const progress = run.progress.sources?.[index] ?? {};
-    const available = state.workspace.processings.filter(item => item.templateId === source.templateId && item.type === source.processingType);
+    const available = state.workspace.processings.filter(item => item.templateId === source.templateId);
     const ready = !active.has(run.state) && (progress.rows > 0 || progress.state === 'completed');
     const saved = Object.entries(run.progress.processingExports ?? {}).filter(([key]) => key.startsWith(`${index}:`));
     return h('div', { class: 'source-card' }, cluster(h('h3', {}, source.name), progress.state && pill(progress.state)),

@@ -7,7 +7,7 @@ const { finished } = require('node:stream/promises');
 const ExcelJS = require('exceljs');
 const { InputError, get, inferShape, isLosslessNumber, parseJson, publicValue, scalarText, stringify } = require('./json.cjs');
 const { demand } = require('./model.cjs');
-const { processingRows } = require('./processings.cjs');
+const { processingRows, processingSteps, recordSample } = require('./processings.cjs');
 
 const XLSX_ROWS = 1_048_575;
 const DAY = 86_400_000;
@@ -85,10 +85,35 @@ async function* records(store, run, sourceIndex, signal) {
 }
 
 async function* outputRecords(store, run, index, processing = run.snapshot.sources[index]?.processing) {
+  const steps = processing ? processingSteps(processing) : null;
   for await (const record of records(store, run, index)) {
-    if (processing) yield* processingRows(processing, record);
+    if (steps) yield* processingRows(steps, record);
     else yield record;
   }
+}
+
+async function previewProcessing(store, run, index, processing) {
+  const steps = processingSteps(processing);
+  const input = { rows: 0, samples: [] };
+  const stages = steps.map(step => ({ type: step.type, input: 0, rows: 0, errors: 0, samples: [] }));
+  const output = { rows: 0, samples: [] };
+  let error;
+  try {
+    for await (const record of records(store, run, index)) {
+      recordSample(input, record);
+      for (const row of processingRows(steps, record, stages)) {
+        if (output.samples.length < 3) {
+          recordSample(output, Object.fromEntries(processing.columns.map(column => [column.name, cellFrom(column, row, undefined, row)])));
+        } else {
+          output.rows++;
+        }
+      }
+    }
+  } catch (failure) {
+    if (!(failure instanceof InputError)) throw failure;
+    error = failure.message;
+  }
+  return { input, stages, output, error };
 }
 
 async function preview(store, run, source, offset) {
@@ -363,5 +388,5 @@ async function prune(store, now = Date.now()) {
   }
 }
 
-module.exports = { exportRun, generalLog, logEvent, logTail, pageFile, preview, prune, records,
+module.exports = { exportRun, generalLog, logEvent, logTail, pageFile, preview, previewProcessing, prune, records,
   referenceValues, runLog, sample, saveSample, writePage };

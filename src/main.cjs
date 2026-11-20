@@ -6,7 +6,7 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const { Store } = require('./core/store.cjs');
 const { Service } = require('./core/service.cjs');
-const { InputError, stringify } = require('./core/json.cjs');
+const { InputError, readJson, stringify } = require('./core/json.cjs');
 const { demand, id } = require('./core/model.cjs');
 const { logEvent } = require('./core/datasets.cjs');
 
@@ -35,7 +35,20 @@ let workerIssue;
 
 const queued = new Set();
 const running = new Set();
-const exportsInFlight = new Map();
+const workerRequests = new Map();
+
+function requestWorker(action, data) {
+  demand(workerReady && !quitting, 'Рабочий процесс сейчас недоступен.');
+  return new Promise((resolve, reject) => {
+    const requestId = randomUUID();
+    workerRequests.set(requestId, { resolve, reject });
+    try { worker.postMessage({ action, requestId, ...data }); }
+    catch {
+      workerRequests.delete(requestId);
+      reject(new InputError('Рабочий процесс недоступен.'));
+    }
+  });
+}
 
 function pump() {
   if (!workerReady || quitting) return;
@@ -59,7 +72,7 @@ function dispatch(id) {
 }
 
 function finishExit() {
-  if (!quitting || running.size || exportsInFlight.size || exiting) return;
+  if (!quitting || running.size || workerRequests.size || exiting) return;
   exiting = true;
   worker?.kill();
   tray?.destroy();
@@ -91,11 +104,11 @@ function startWorker() {
       pump();
       finishExit();
     }
-    if (message.event === 'exported') {
-      const pending = exportsInFlight.get(message.requestId);
-      exportsInFlight.delete(message.requestId);
+    if (message.event === 'result') {
+      const pending = workerRequests.get(message.requestId);
+      workerRequests.delete(message.requestId);
       if (message.error) pending?.reject(new InputError(message.error));
-      else pending?.resolve();
+      else pending?.resolve(message.value);
       finishExit();
     }
     if (message.event === 'maintenance-error') workerIssue = 'Не удалось очистить часть старых файлов.';
@@ -103,8 +116,8 @@ function startWorker() {
   child.on('exit', () => {
     workerReady = false;
     running.clear();
-    for (const task of exportsInFlight.values()) task.reject(new InputError('Рабочий процесс завершился.'));
-    exportsInFlight.clear();
+    for (const task of workerRequests.values()) task.reject(new InputError('Рабочий процесс завершился.'));
+    workerRequests.clear();
     if (quitting) { finishExit(); return; }
     workerIssue = 'Рабочий процесс завершился.';
     if (recoveryFailures++ === 0) startWorker();
@@ -143,7 +156,7 @@ function beginExit() {
   clearInterval(scheduleTimer);
   clearInterval(retentionTimer);
   tray?.setToolTip('MP API • завершение заданий');
-  if (running.size || exportsInFlight.size) openWindow();
+  if (running.size || workerRequests.size) openWindow();
   finishExit();
 }
 
@@ -216,6 +229,12 @@ async function actions(action, value) {
       return service.saveDraft(user, value.json);
     case 'publish':
       return service.publish(user, value.templateId);
+    case 'templateUsage':
+      return service.templateUsage(user, value.templateId);
+    case 'archiveTemplate':
+      return service.archiveTemplate(user, value.templateId, value.archived);
+    case 'deleteTemplate':
+      return service.deleteTemplate(user, value.templateId);
     case 'versions':
       demand(user.role !== 'user', 'Версии доступны настройщику.');
       return store.versions(id(value.templateId)).map(({ version, published, value }) =>
@@ -231,7 +250,17 @@ async function actions(action, value) {
     case 'deleteJob':
       return service.deleteJob(user, value.jobId);
     case 'processing':
-      return service.saveProcessing(user, value);
+      return service.saveProcessing(user, readJson(value.json, 'Обработка'));
+    case 'deleteProcessing':
+      return service.deleteProcessing(user, value.processingId);
+    case 'processingRuns':
+      return service.processingRuns(user, value.templateId);
+    case 'processingPreview': {
+      const { runId, sourceIndex, processing } = service.processingPreview(user, {
+        ...readJson(value.json, 'Обработка'), runId: value.runId, source: value.source,
+      });
+      return requestWorker('processingPreview', { runId, sourceIndex, processingJson: stringify(processing) });
+    }
     case 'run': {
       demand(!quitting && workerReady, 'Рабочий процесс сейчас недоступен.');
       const id = service.createRun(user, value);
@@ -257,16 +286,9 @@ async function actions(action, value) {
       const run = service.getRun(user, value.runId);
       demand(!activeStates.has(run.state) && workerReady && !quitting, 'Дождитесь завершения задания.');
       demand(['csv', 'xlsx'].includes(value.format), 'Выберите CSV или XLSX.');
-      const output = value.processingId ? service.processingFromRun(user, run, value) : {};
-      const requestId = randomUUID();
-      return new Promise((resolve, reject) => {
-        exportsInFlight.set(requestId, { resolve, reject });
-        try { worker.postMessage({ action: 'export', requestId, runId: run.id, format: value.format, ...output }); }
-        catch {
-          exportsInFlight.delete(requestId);
-          reject(new InputError('Рабочий процесс недоступен.'));
-        }
-      });
+      const { processing, sourceIndex } = value.processingId ? service.processingFromRun(user, run, value) : {};
+      return requestWorker('export', { runId: run.id, format: value.format, sourceIndex,
+        processingJson: processing && stringify(processing) });
     }
     case 'openOutput': {
       const run = service.getRun(user, value.runId);

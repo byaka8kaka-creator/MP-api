@@ -45,7 +45,7 @@ class Store {
         PRIMARY KEY(connection_id, endpoint_id, profile_id, environment)
       );
       CREATE TABLE IF NOT EXISTS templates (
-        id TEXT PRIMARY KEY, draft TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, sample_run_id TEXT
+        id TEXT PRIMARY KEY, draft TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, sample_run_id TEXT, archived_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS template_versions (
         template_id TEXT REFERENCES templates(id), version INTEGER NOT NULL, value TEXT NOT NULL,
@@ -80,6 +80,9 @@ class Store {
     this.transaction(() => {
       if (!this.db.prepare('PRAGMA table_info(jobs)').all().some(column => column.name === 'deleted_at')) {
         this.db.exec('ALTER TABLE jobs ADD COLUMN deleted_at INTEGER');
+      }
+      if (!this.db.prepare('PRAGMA table_info(templates)').all().some(column => column.name === 'archived_at')) {
+        this.db.exec('ALTER TABLE templates ADD COLUMN archived_at INTEGER');
       }
     });
     if (seed && !this.setting('initialized')) this.seed();
@@ -208,7 +211,7 @@ class Store {
 
   templates() {
     return this.db.prepare(`
-      SELECT t.id, t.draft, t.version, t.sample_run_id, v.value AS published
+      SELECT t.id, t.draft, t.version, t.sample_run_id, t.archived_at, v.value AS published
       FROM templates t LEFT JOIN template_versions v ON v.template_id = t.id AND v.version = t.version
       ORDER BY t.rowid
     `).all().map(row => decode(row, ['draft', 'published']));
@@ -216,7 +219,7 @@ class Store {
 
   template(id) {
     return decode(this.db.prepare(`
-      SELECT t.id, t.draft, t.version, t.sample_run_id, v.value AS published
+      SELECT t.id, t.draft, t.version, t.sample_run_id, t.archived_at, v.value AS published
       FROM templates t LEFT JOIN template_versions v ON v.template_id = t.id AND v.version = t.version WHERE t.id = ?
     `).get(id), ['draft', 'published']);
   }
@@ -229,6 +232,16 @@ class Store {
   putDraft(template) {
     this.db.prepare('INSERT INTO templates (id, draft) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET draft = excluded.draft')
       .run(template.id, stringify(template));
+  }
+
+  archiveTemplate(id, archived) {
+    this.db.prepare('UPDATE templates SET archived_at = ? WHERE id = ?').run(archived ? Date.now() : null, id);
+  }
+
+  removeTemplate(id) {
+    this.db.prepare('DELETE FROM dictionaries WHERE template_id = ?').run(id);
+    this.db.prepare('DELETE FROM template_versions WHERE template_id = ?').run(id);
+    this.db.prepare('DELETE FROM templates WHERE id = ?').run(id);
   }
 
   publish(id) {
@@ -260,6 +273,10 @@ class Store {
   putProcessing(processing) {
     this.db.prepare('INSERT INTO processings VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value')
       .run(processing.id, stringify(processing));
+  }
+
+  removeProcessing(id) {
+    this.db.prepare('DELETE FROM processings WHERE id = ?').run(id);
   }
 
   putFolder(kind, scope, path) {

@@ -5,7 +5,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 const ExcelJS = require('exceljs');
-const { exportRun, logTail, runLog, sample, writePage } = require('../src/core/datasets.cjs');
+const { exportRun, logTail, previewProcessing, runLog, sample, writePage } = require('../src/core/datasets.cjs');
 const { parseJson, stringify } = require('../src/core/json.cjs');
 const { LimitScheduler } = require('../src/core/limits.cjs');
 const { batches, inputValues, requestFor, validateConnection, validateTemplate } = require('../src/core/model.cjs');
@@ -651,4 +651,99 @@ test('удаление выгрузки сохраняет шаблон, обр�
   const run = service.getRun(owner, runId);
   assert.equal(run.state, 'completed');
   assert.ok(await fs.stat(run.progress.exportPath));
+});
+
+test('редактируемые шаги показывают счётчики, образцы и ошибки на сохранённых данных', async t => {
+  const fx = await fixture(t, () => ({ body: '{"orders":[' +
+    '{"id":9223372036854775807,"details":[{"date":"2026-11-18","count":0},{"date":"некорректная дата","count":5}]} ,' +
+    '{"id":5,"details":[]},{"id":8,"details":"ошибка"}],"next":0}' }));
+  const { service, store, user } = fx;
+  const runId = service.createRun(user, { kind: 'test', entry: { templateId: 'wb-orders' } });
+  await fx.run(runId);
+  const run = store.run(runId);
+  const config = { name: 'Тест шагов', templateId: 'wb-orders', runId, source: 0, steps: [
+    { type: 'filter', path: 'details', operator: 'arrayNotEmpty', onError: 'skip' },
+    { type: 'expandArray', path: 'details', as: 'item' },
+    { type: 'validate', checks: [{ path: 'item.date', kind: 'date' }], onError: 'skip' },
+    { type: 'copy', fields: [{ from: 'id', to: 'id' }, { from: 'item.count', to: 'count' }] },
+  ], columns: [{ path: 'id', name: 'Номер' }, { path: 'count', name: 'Количество' }] };
+  assert.equal(service.processingRuns(user, 'wb-orders')[0].rows, 3);
+  const { processing, sourceIndex } = service.processingPreview(user, config);
+  const result = await previewProcessing(store, run, sourceIndex, processing);
+  assert.equal(result.error, undefined);
+  assert.equal(result.input.rows, 3);
+  assert.deepEqual(result.stages.map(({ input, rows, errors }) => [input, rows, errors]), [
+    [3, 1, 1], [1, 2, 0], [2, 1, 1], [1, 1, 0],
+  ]);
+  assert.deepEqual(JSON.parse(result.output.samples[0]), { 'Номер': '9223372036854775807', 'Количество': 0 });
+  const saved = service.saveProcessing(user, config);
+  const output = await exportRun(store, run, 'csv', service.processingFromRun(user, run, { processingId: saved, source: 0 }));
+  const report = JSON.parse(await fs.readFile(path.join(output, 'результат.json'), 'utf8'));
+  assert.equal(report.tables[0].rows, 1);
+
+  const strict = service.processingPreview(user, { ...config, steps: config.steps.map(step => ({ ...step, onError: 'stop' })) });
+  const stopped = await previewProcessing(store, run, sourceIndex, strict.processing);
+  assert.match(stopped.error, /Шаг 3/);
+  assert.throws(() => service.saveProcessing(user, { ...config, steps: [{ type: 'validate', checks: [] }] }), /Шаг 1/);
+  assert.equal(fx.requests.length, 1);
+});
+
+test('архив шаблонов сохраняет связанные выгрузки, а удаление проверяет зависимости', async t => {
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === '/adv/v1/promotion/count') return { body: '{"adverts":[{"advert_list":[{"advertId":1}]}]}' };
+    if (request.url.pathname === '/api/advert/v3/adverts') return { body: '{"adverts":[{"advertId":1,"nms":[{"nmId":10}]}]}' };
+    return { body: '{"items":[]}' };
+  });
+  const { service, store, user } = fx;
+  const [first, middle, last] = installAdvertising(fx);
+  const owner = store.createUser('template-viewer', 'FixturePassword!234', 'user');
+  const processingId = service.saveProcessing(user, { templateId: last, name: 'Кластеры' });
+  const job = { name: 'Статистика по расписанию', format: 'csv', entries: [
+    { templateId: last, processingId, values: '{"from":"2026-11-18","to":"2026-11-19"}' },
+  ] };
+  const jobId = service.saveJob(owner, job);
+  const usage = service.templateUsage(user, first);
+  assert.equal(usage.jobs[0].name, job.name);
+  assert.equal(usage.jobs[0].indirect, true);
+  assert.equal(usage.processings[0].name, 'Кластеры');
+  assert.equal(usage.templates.length, 2);
+  assert.throws(() => service.templateUsage(owner, first), /настройщику/);
+  assert.throws(() => service.deleteTemplate(user, first), /Шаблон используется/);
+  assert.throws(() => service.deleteProcessing(user, processingId), /выгрузок/);
+
+  const draftSource = service.saveDraft(user, JSON.stringify({ ...store.template(first).draft, id: undefined, name: 'Новый список' }));
+  const middleDraft = store.template(middle).draft;
+  service.saveDraft(user, JSON.stringify({ ...middleDraft, parameters: middleDraft.parameters.map(parameter =>
+    parameter.reference ? { ...parameter, reference: { ...parameter.reference, templateId: draftSource } } : parameter) }));
+  const draftUsage = service.templateUsage(user, draftSource);
+  assert.deepEqual(draftUsage.jobs, []);
+  assert.deepEqual(draftUsage.processings, []);
+  assert.equal(draftUsage.templates.length, 2);
+  assert.ok(draftUsage.templates.every(template => template.draftOnly));
+  assert.throws(() => service.deleteTemplate(user, draftSource), /Шаблон используется/);
+
+  store.db.exec('ALTER TABLE templates DROP COLUMN archived_at');
+  const reopened = new Store(store.root);
+  reopened.close();
+  service.archiveTemplate(user, first, true);
+  service.archiveTemplate(user, last, true);
+  assert.equal(service.workspace(owner).options.find(option => option.id === first).archived, true);
+  assert.throws(() => service.saveJob(owner, job), /Восстановите шаблон/);
+  assert.throws(() => service.publish(user, first), /Восстановите шаблон/);
+  assert.equal(service.saveJob(owner, { ...job, id: jobId }), jobId);
+  const runId = service.createRun(owner, { kind: 'job', jobId });
+  await fx.run(runId);
+  assert.equal(store.run(runId).state, 'completed');
+  assert.equal(fx.requests.length, 3);
+
+  service.deleteJob(owner, jobId);
+  service.deleteProcessing(user, processingId);
+  service.deleteTemplate(user, last);
+  service.deleteTemplate(user, middle);
+  service.deleteTemplate(user, draftSource);
+  service.archiveTemplate(user, first, false);
+  service.deleteTemplate(user, first);
+  assert.equal(store.template(last), null);
+  assert.ok(store.run(runId).progress.exportPath);
+  assert.ok(await fs.stat(store.run(runId).progress.exportPath));
 });
