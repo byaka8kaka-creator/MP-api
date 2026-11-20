@@ -524,7 +524,7 @@ function jobEditor(job) {
       }
       const env = select([['production', 'Рабочая'], ['sandbox', 'Песочница', !template.sandbox]], previous?.environment ?? 'production');
       const params = parameterValues(template, previous?.values);
-      const available = template.supportsFunnel ? processings.filter(item => item.templateId === template.id) : [];
+      const available = processings.filter(item => item.templateId === template.id && item.type === template.processingType);
       const modes = [['', 'Без обработки'], ...available.map(item => [item.id, item.name])];
       if (previous?.processingId && !available.some(item => item.id === previous.processingId)) {
         modes.push([previous.processingId, 'Сохранённая обработка недоступна', true]);
@@ -556,7 +556,7 @@ function jobEditor(job) {
 
 function processingPage(workspace) {
   const editor = state.user.role !== 'user';
-  const supported = workspace.options.some(option => option.supportsFunnel);
+  const supported = workspace.options.some(option => option.processingType);
   return [
     header('Обработки', 'Подготовьте данные для Excel или CSV. Обработку можно добавить в новую выгрузку или применить к результату в журнале.',
       editor && btn('Новая обработка', () => processingEditor(), 'primary', !supported)),
@@ -564,29 +564,39 @@ function processingPage(workspace) {
       workspace.processings.length
         ? table(['Обработка', 'Шаблон запроса', 'Колонки', 'Действия'], workspace.processings.map(processing => {
           const template = workspace.options.find(option => option.id === processing.templateId);
-          return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, processing.name),
-            h('small', {}, 'Воронка Wildberries · Строка на период')),
+          return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, processing.name)),
           h('td', {}, template?.name),
           h('td', {}, number.format(processing.columns.length)),
           h('td', {}, cluster(editor && btn('Изменить', () => processingEditor(processing), 'compact'),
             btn('История запусков', () => { state.page = 'logs'; render(); }, 'compact'))));
         }))
         : h('div', { class: 'empty' }, editor && !supported
-          ? 'Опубликуйте шаблон /api/analytics/v3/sales-funnel/products с путём к строкам data.products.'
+          ? 'Опубликуйте шаблон воронки или статистики поисковых кластеров Wildberries.'
           : 'Сохранённых обработок пока нет.')),
   ];
 }
 
 function processingEditor(saved) {
-  const { options, funnelDefaults } = state.workspace;
-  const choices = options.filter(item => item.supportsFunnel || item.id === saved?.templateId);
+  const { options, processingDefaults } = state.workspace;
+  const choices = options.filter(item => item.processingType || item.id === saved?.templateId);
   const template = select(choices.map(item => [item.id, item.name]), saved?.templateId);
   template.disabled = Boolean(saved);
-  const name = input(saved?.name ?? funnelDefaults.name, { required: true, maxlength: 160 });
-  const columns = textarea(pretty(saved?.columns ?? funnelDefaults.columns), 11, 'Колонки результата');
+  const selectedDefaults = () => processingDefaults[saved?.type ?? choices.find(item => item.id === template.value)?.processingType];
+  let defaults = selectedDefaults();
+  const name = input(saved?.name ?? defaults.name, { required: true, maxlength: 160 });
+  const columns = textarea(pretty(saved?.columns ?? defaults.columns), 11, 'Колонки результата');
+  const description = h('p', { class: 'caption' }, defaults.description);
+  template.addEventListener('change', () => {
+    const next = selectedDefaults();
+    if (next === defaults) return;
+    if (!name.value.trim() || name.value === defaults.name) name.value = next.name;
+    columns.value = pretty(next.columns);
+    description.textContent = next.description;
+    defaults = next;
+  });
   formModal(saved ? 'Изменить обработку' : 'Новая обработка', [
     fields(field('Название', name), field('Шаблон запроса', template)),
-    h('p', { class: 'caption' }, 'Воронка Wildberries создаёт для каждой карточки строку текущего периода и строку предыдущего периода, если он есть.'),
+    description,
     h('details', { class: 'fold' }, h('summary', {}, 'Колонки результата'), columns),
   ], 'Сохранить', async () => {
     await call('processing', { id: saved?.id, templateId: template.value, name: name.value,
@@ -867,7 +877,7 @@ async function runDetails(runId) {
   const logs = btn('Открыть журнал', () => showLogs({ runId }));
   const results = run.sources.map((source, index) => {
     const progress = run.progress.sources?.[index] ?? {};
-    const available = state.workspace.processings.filter(item => item.templateId === source.templateId);
+    const available = state.workspace.processings.filter(item => item.templateId === source.templateId && item.type === source.processingType);
     const ready = !active.has(run.state) && (progress.rows > 0 || progress.state === 'completed');
     const saved = Object.entries(run.progress.processingExports ?? {}).filter(([key]) => key.startsWith(`${index}:`));
     return h('div', { class: 'source-card' }, cluster(h('h3', {}, source.name), progress.state && pill(progress.state)),
@@ -878,7 +888,7 @@ async function runDetails(runId) {
       progress.warning && h('p', { class: 'notice' }, progress.warning),
       source.values && h('details', { class: 'fold' }, h('summary', {}, 'Параметры запуска'), h('pre', { class: 'pre mono' }, source.values)),
       cluster(progress.rows > 0 && btn('Просмотр строк', () => showPreview(runId, index, 0), 'compact'),
-        source.supportsFunnel && ready && available.length > 0 &&
+        ready && available.length > 0 &&
           btn('Применить обработку', () => processSavedRun(runId, index, available), 'compact')),
       saved.map(([key, output]) => cluster(h('small', { class: 'caption' }, `${output.name} · ${output.format.toUpperCase()}`),
         btn('Открыть обработанные файлы', () => call('openOutput', {

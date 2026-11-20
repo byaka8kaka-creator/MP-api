@@ -4,7 +4,7 @@ const path = require('node:path');
 const { InputError, object, publicValue, readJson, stringify } = require('./json.cjs');
 const { demand, folder, id, inputValues, profileFor, text, validateConnection, validateTemplate } = require('./model.cjs');
 const { generalLog, logEvent, logTail, preview, referenceValues, runLog, sample } = require('./datasets.cjs');
-const { FUNNEL_COLUMNS, FUNNEL_NAME, isFunnel, validateProcessing } = require('./processings.cjs');
+const { processingDefaults, processingType, validateProcessing } = require('./processings.cjs');
 const { scheduleDecision, validateSchedule } = require('./schedule.cjs');
 
 function canConfigure(user) {
@@ -68,10 +68,10 @@ class Service {
         const option = formTemplate(record.published, record.version);
         const connection = connections.find(item => item.id === option.connectionId);
         const endpoint = connection?.endpoints.find(item => item.id === record.published.endpointId);
-        return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), supportsFunnel: isFunnel(record.published) };
+        return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), processingType: processingType(record.published) };
       }),
       processings: store.processings().filter(item => visibleIds.has(item.templateId)),
-      funnelDefaults: editor ? { name: FUNNEL_NAME, columns: FUNNEL_COLUMNS } : null,
+      processingDefaults: editor ? processingDefaults : null,
       connections: editor ? connections : [],
       templates: editor ? all.map(item => ({
         id: item.id, version: item.version, draft: publicValue(item.draft), draftJson: stringify(item.draft, null, 2),
@@ -99,7 +99,7 @@ class Service {
     const templateId = id(value.templateId);
     demand(!previous || previous.templateId === templateId, 'Создайте отдельную обработку для другого шаблона.');
     const template = this.store.template(templateId)?.published;
-    const processing = validateProcessing({ ...value, id: processingId }, template);
+    const processing = validateProcessing({ ...value, id: processingId, type: previous?.type }, template);
     this.store.putProcessing(processing);
     return processingId;
   }
@@ -379,7 +379,7 @@ class Service {
         }
         return {
           name: source.template.name, version: source.version, environment: source.environment,
-          templateId: source.template.id, processingName: source.processing?.name, supportsFunnel: isFunnel(source.template),
+          templateId: source.template.id, processingName: source.processing?.name, processingType: processingType(source.template),
           isDependency: Boolean(source.isDependency), values: stringify(values, null, 2),
         };
       }),

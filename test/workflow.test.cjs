@@ -9,7 +9,7 @@ const { exportRun, logTail, runLog, sample, writePage } = require('../src/core/d
 const { parseJson, stringify } = require('../src/core/json.cjs');
 const { LimitScheduler } = require('../src/core/limits.cjs');
 const { batches, inputValues, requestFor, validateConnection, validateTemplate } = require('../src/core/model.cjs');
-const { FUNNEL_COLUMNS, FUNNEL_PATH } = require('../src/core/processings.cjs');
+const { CLUSTERS_COLUMNS, FUNNEL_COLUMNS, FUNNEL_PATH } = require('../src/core/processings.cjs');
 const { executeRun } = require('../src/core/runner.cjs');
 const { DEFER_MS, scheduleDecision } = require('../src/core/schedule.cjs');
 const { Service } = require('../src/core/service.cjs');
@@ -546,4 +546,55 @@ test('пустая цепочка пропускает HTTP-запросы, а �
   assert.match(failed.progress.sources[0].error, /из зависимого запроса/);
   assert.deepEqual(requests.map(request => request.url.pathname), [countPath, detailPath, detailPath]);
   assert.equal(failed.progress.exportPath, undefined);
+});
+
+test('обработка кластеров разворачивает dailyStats и пропускает пустые записи', async t => {
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === '/adv/v1/promotion/count') return { body: '{"adverts":[{"advert_list":[{"advertId":10}]}]}' };
+    if (request.url.pathname === '/api/advert/v3/adverts') return { body: '{"adverts":[{"advertId":10,"nms":[{"nmId":20}]}]}' };
+    return { body: '{"items":[' +
+      '{"advertId":10,"nmId":20},' +
+      '{"advertId":10,"nmId":21,"dailyStats":[]},' +
+      '{"advertId":10,"nmId":22,"dailyStats":null},' +
+      '{"advertId":10,"nmId":9223372036854775807,"dailyStats":[' +
+      '{"date":"2026-11-16","stat":{"clicks":0,"normQuery":"корм","spend":1.25}},' +
+      '{"date":"2026-11-16","stat":{"clicks":1,"normQuery":"сухой корм","spend":0}}]},' +
+      '{"advertId":10,"nmId":20,"dailyStats":[{"date":"2026-11-17","stat":{"orders":2}}]}' +
+      ']}' };
+  });
+  const { service, store, user, requests } = fx;
+  const [, , templateId] = installAdvertising(fx);
+  const processingId = service.saveProcessing(user, { templateId, name: 'Кластеры по дням' });
+  const entry = { templateId, values: '{"from":"2026-11-16","to":"2026-11-18"}' };
+  const jobId = service.saveJob(user, { name: 'Исходная выгрузка', format: 'csv', entries: [entry] });
+  const runId = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(runId);
+  const stored = store.run(runId);
+  const result = await exportRun(store, stored, 'xlsx', service.processingFromRun(user, stored, { source: 0, processingId }));
+  assert.equal(requests.length, 3);
+  const meta = JSON.parse(await fs.readFile(path.join(result, 'результат.json'), 'utf8'));
+  assert.deepEqual(meta.tables, [{ name: 'Кластеры по дням', rows: 3 }]);
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(path.join(result, 'Кластеры по дням.xlsx'));
+  const [sheet] = workbook.worksheets;
+  assert.equal(sheet.rowCount, 4);
+  assert.deepEqual(sheet.getRow(1).values.slice(1), CLUSTERS_COLUMNS.map(column => column.name));
+  assert.deepEqual(sheet.getRow(2).values.slice(1, 4), [10, '9223372036854775807', '2026-11-16']);
+  assert.deepEqual(sheet.getRow(3).values.slice(1, 4), [10, '9223372036854775807', '2026-11-16']);
+  assert.deepEqual(sheet.getRow(4).values.slice(1, 4), [10, 20, '2026-11-17']);
+  assert.equal(sheet.getCell('F2').value, 0);
+  assert.equal(sheet.getCell('K3').value, 'сухой корм');
+  assert.equal(sheet.getCell('N3').value, 0);
+  assert.ok(await fs.stat(stored.progress.exportPath));
+
+  const automaticJob = service.saveJob(user, { name: 'Обработанная выгрузка', format: 'csv',
+    entries: [{ ...entry, processingId }] });
+  const automaticId = service.createRun(user, { kind: 'job', jobId: automaticJob });
+  await fx.run(automaticId);
+  const automatic = store.run(automaticId);
+  assert.equal(automatic.state, 'completed');
+  const preview = await service.result(user, { runId: automaticId, source: 0, offset: 0 });
+  assert.equal(preview.rows.length, 3);
+  assert.equal(preview.rows[0].stat.normQuery, 'корм');
+  assert.equal(preview.rows[1].stat.normQuery, 'сухой корм');
 });

@@ -3,7 +3,8 @@ const { columns, dateMs, demand, id, text } = require('./model.cjs');
 
 const FUNNEL_PATH = '/api/analytics/v3/sales-funnel/products';
 const FUNNEL_TYPE = 'wb-funnel-periods';
-const FUNNEL_NAME = 'Воронка WB по периодам';
+const CLUSTERS_PATH = '/adv/v1/normquery/stats';
+const CLUSTERS_TYPE = 'wb-search-clusters-by-day';
 
 const FUNNEL_COLUMNS = [
   ['product.nmId', 'Артикул WB'],
@@ -44,21 +45,13 @@ const FUNNEL_COLUMNS = [
   ['statistic.conversions.buyoutPercent', 'Выкуп, %'],
 ].map(([path, name]) => ({ path, name }));
 
-function isFunnel(template) {
-  return template?.path === FUNNEL_PATH && template.response.rows === 'data.products';
-}
+const CLUSTERS_COLUMNS = [
+  ...['advertId', 'nmId', 'date'].map(name => ({ path: name, name })),
+  ...['atbs', 'avgPos', 'clicks', 'cpc', 'cpm', 'ctr', 'currency', 'normQuery', 'orders', 'shks', 'spend', 'views']
+    .map(name => ({ path: `stat.${name}`, name })),
+];
 
-function validateProcessing(value, template) {
-  demand(isFunnel(template) && value.templateId === template.id, 'Выберите опубликованный шаблон воронки Wildberries с массивом data.products.');
-  const output = columns(value.columns ?? FUNNEL_COLUMNS);
-  demand(output.length > 0 && output.length <= 16_384, 'Для обработки нужна хотя бы одна колонка.');
-  demand(new Set(output.map(column => column.name)).size === output.length, 'Названия колонок обработки должны различаться.');
-  return { id: id(value.id), templateId: template.id, type: FUNNEL_TYPE,
-    name: text(value.name, 'название обработки'), columns: output };
-}
-
-function* processingRows(processing, record) {
-  demand(processing.type === FUNNEL_TYPE, 'Такой вид обработки не поддерживается.');
+function* funnelRows(record) {
   const article = get(record, 'product.nmId');
   const statistic = get(record, 'statistic');
   demand(article !== undefined && article !== null && object(statistic),
@@ -77,4 +70,58 @@ function* processingRows(processing, record) {
   }
 }
 
-module.exports = { FUNNEL_COLUMNS, FUNNEL_NAME, FUNNEL_PATH, isFunnel, processingRows, validateProcessing };
+function* clusterRows(record) {
+  const dailyStats = get(record, 'dailyStats');
+  if (dailyStats == null) return;
+  demand(Array.isArray(dailyStats), 'Поле dailyStats должно быть массивом.');
+  if (dailyStats.length === 0) return;
+  const { advertId, nmId } = record;
+  demand(advertId != null && nmId != null, 'В записи статистики отсутствует advertId или nmId.');
+  for (const day of dailyStats) {
+    demand(object(day) && Number.isFinite(dateMs(day.date)) && object(day.stat),
+      'Элемент dailyStats должен содержать дату и объект stat.');
+    yield { advertId, nmId, date: day.date, stat: day.stat };
+  }
+}
+
+const kinds = {
+  [FUNNEL_TYPE]: {
+    path: FUNNEL_PATH, rows: 'data.products', transform: funnelRows,
+    name: 'Воронка WB по периодам',
+    description: 'Для каждой карточки создаёт строку текущего периода и строку предыдущего периода, если он есть.',
+    columns: FUNNEL_COLUMNS,
+  },
+  [CLUSTERS_TYPE]: {
+    path: CLUSTERS_PATH, rows: 'items', transform: clusterRows,
+    name: 'Поисковые кластеры WB по дням',
+    description: 'Для каждого элемента dailyStats создаёт строку с ID кампании, артикулом, датой и показателями stat.',
+    columns: CLUSTERS_COLUMNS,
+  },
+};
+
+const processingDefaults = Object.fromEntries(Object.entries(kinds).map(([type, spec]) => [
+  type, { name: spec.name, description: spec.description, columns: spec.columns },
+]));
+
+function processingType(template) {
+  return Object.keys(kinds).find(type => template?.path === kinds[type].path && template.response?.rows === kinds[type].rows) ?? null;
+}
+
+function validateProcessing(value, template) {
+  const type = processingType(template);
+  demand(type && value.templateId === template.id, 'Выберите опубликованный шаблон воронки или статистики кластеров Wildberries.');
+  demand(value.type === undefined || value.type === type, 'Текущий шаблон запроса несовместим с сохранённой обработкой.');
+  const output = columns(value.columns ?? kinds[type].columns);
+  demand(output.length > 0 && output.length <= 16_384, 'Для обработки нужна хотя бы одна колонка.');
+  demand(new Set(output.map(column => column.name)).size === output.length, 'Названия колонок обработки должны различаться.');
+  return { id: id(value.id), templateId: template.id, type,
+    name: text(value.name, 'название обработки'), columns: output };
+}
+
+function* processingRows(processing, record) {
+  demand(Object.hasOwn(kinds, processing.type), 'Такой вид обработки не поддерживается.');
+  yield* kinds[processing.type].transform(record);
+}
+
+module.exports = { CLUSTERS_COLUMNS, CLUSTERS_PATH, FUNNEL_COLUMNS, FUNNEL_PATH, processingDefaults,
+  processingRows, processingType, validateProcessing };
