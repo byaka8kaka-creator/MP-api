@@ -51,6 +51,7 @@ class Store {
         template_id TEXT REFERENCES templates(id), version INTEGER NOT NULL, value TEXT NOT NULL,
         published INTEGER NOT NULL, PRIMARY KEY (template_id, version)
       );
+      CREATE TABLE IF NOT EXISTS processings (id TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS folders (
         kind TEXT, scope TEXT, path TEXT, PRIMARY KEY (kind, scope, path)
       );
@@ -240,6 +241,20 @@ class Store {
 
   folders() {
     return this.db.prepare('SELECT * FROM folders ORDER BY path').all();
+  }
+
+  processings() {
+    return this.db.prepare('SELECT value FROM processings ORDER BY rowid').all().map(row => parseJson(row.value));
+  }
+
+  processing(id) {
+    const row = this.db.prepare('SELECT value FROM processings WHERE id = ?').get(id);
+    return row ? parseJson(row.value) : null;
+  }
+
+  putProcessing(processing) {
+    this.db.prepare('INSERT INTO processings VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET value = excluded.value')
+      .run(processing.id, stringify(processing));
   }
 
   putFolder(kind, scope, path) {

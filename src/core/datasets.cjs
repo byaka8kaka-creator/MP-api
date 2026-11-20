@@ -7,6 +7,7 @@ const { finished } = require('node:stream/promises');
 const ExcelJS = require('exceljs');
 const { InputError, get, inferShape, isLosslessNumber, parseJson, publicValue, scalarText, stringify } = require('./json.cjs');
 const { demand } = require('./model.cjs');
+const { processingRows } = require('./processings.cjs');
 
 const XLSX_ROWS = 1_048_575;
 const DAY = 86_400_000;
@@ -83,10 +84,17 @@ async function* records(store, run, sourceIndex, signal) {
   }
 }
 
+async function* outputRecords(store, run, index, processing = run.snapshot.sources[index]?.processing) {
+  for await (const record of records(store, run, index)) {
+    if (processing) yield* processingRows(processing, record);
+    else yield record;
+  }
+}
+
 async function preview(store, run, source, offset) {
   const rows = [];
   let index = 0;
-  for await (const record of records(store, run, source)) {
+  for await (const record of outputRecords(store, run, source)) {
     if (index++ < offset) continue;
     rows.push(publicValue(record));
     if (rows.length > 30) break;
@@ -123,8 +131,8 @@ function cellFrom(column, row, item, parent) {
   return cellValue(get(row, column.path));
 }
 
-async function* tabularRows(store, run, sourceIndex, columns, expansion, separate) {
-  for await (const record of records(store, run, sourceIndex)) {
+async function* tabularRows(store, run, sourceIndex, columns, expansion, separate, processing) {
+  for await (const record of outputRecords(store, run, sourceIndex, processing)) {
     if (expansion === undefined) {
       yield columns.map(column => cellFrom(column, record, undefined, record));
       continue;
@@ -140,18 +148,24 @@ async function* tabularRows(store, run, sourceIndex, columns, expansion, separat
   }
 }
 
-function tables(store, run) {
+function tables(store, run, override, sourceIndex) {
   return run.snapshot.sources.flatMap((source, index) => {
+    if (override && index !== sourceIndex) return [];
+    const processing = override ?? source.processing;
+    if (processing) return [{
+      name: processing.name, headers: processing.columns.map(column => column.name),
+      rows: tabularRows(store, run, index, processing.columns, undefined, false, processing), rowCount: 0,
+    }];
     const response = source.template.response;
     const main = tableColumns(response.columns);
     const definitions = [{
       name: source.template.name, headers: main.map(column => column.name),
-      rows: tabularRows(store, run, index, main, response.expand, false),
+      rows: tabularRows(store, run, index, main, response.expand, false), rowCount: 0,
     }];
     for (const table of response.tables) {
       const fields = tableColumns(table.columns);
       definitions.push({ name: table.name, headers: fields.map(column => column.name),
-        rows: tabularRows(store, run, index, fields, table.path, true) });
+        rows: tabularRows(store, run, index, fields, table.path, true), rowCount: 0 });
     }
     return definitions;
   });
@@ -183,6 +197,7 @@ async function writeCsv(dir, definitions) {
       await file.write(`\ufeff${table.headers.map(csvCell).join(',')}\r\n`);
       let buffer = '';
       for await (const row of table.rows) {
+        table.rowCount++;
         buffer += `${row.map(csvCell).join(',')}\r\n`;
         if (buffer.length >= 128 * 1024) {
           await file.write(buffer);
@@ -229,6 +244,7 @@ async function writeXlsx(dir, name, definitions, rowLimit) {
           demand(row.every(value => typeof value !== 'string' || value.length <= 32_767),
             'Значение длиннее 32 767 символов. Для этой выгрузки доступен CSV.');
           sheet.addRow(row).commit();
+          table.rowCount++;
           cursors[index] = await table.rows.next();
         }
         sheet.commit();
@@ -245,19 +261,23 @@ async function writeXlsx(dir, name, definitions, rowLimit) {
   }
 }
 
-async function exportRun(store, run, format, { rowLimit = XLSX_ROWS } = {}) {
+async function exportRun(store, run, format, { rowLimit = XLSX_ROWS, processing, sourceIndex } = {}) {
   demand(['xlsx', 'csv'].includes(format), 'Выберите XLSX или CSV.');
-  demand(run.snapshot.sources.length && Object.values(run.progress.sources ?? {}).some(source =>
-    source.rows > 0 || source.state === 'completed'), 'Доступных результатов для экспорта нет.');
+  const sources = processing ? { [sourceIndex]: run.progress.sources?.[sourceIndex] } : run.progress.sources;
+  demand(run.snapshot.sources.length && Object.values(sources ?? {}).some(source =>
+    source?.rows > 0 || source?.state === 'completed'), 'Доступных результатов для экспорта нет.');
+  const title = processing?.name ?? run.name;
+  const definitions = tables(store, run, processing, sourceIndex);
+  demand(definitions.length, 'Доступных таблиц для экспорта нет.');
   const target = path.join(store.root, 'exports');
   const temporary = await fs.mkdtemp(path.join(target, '.export-'));
-  const name = `${run.state === 'completed' ? '' : 'ЧАСТИЧНО-'}${fileName(run.name)}`;
-  const definitions = tables(store, run);
+  const name = `${run.state === 'completed' ? '' : 'ЧАСТИЧНО-'}${fileName(title)}`;
   try {
     if (format === 'csv') await writeCsv(temporary, definitions);
     if (format === 'xlsx') await writeXlsx(temporary, name, definitions, rowLimit);
     await fs.writeFile(path.join(temporary, 'результат.json'), JSON.stringify({
-      id: run.id, name: run.name, state: run.state, sources: run.progress.sources,
+      id: run.id, name: title, state: run.state, sources,
+      tables: definitions.map(table => ({ name: table.name, rows: table.rowCount })),
     }, null, 2), { mode: 0o600 });
     const dir = path.join(target, `${run.id}--${name}-${format}-${randomUUID().slice(0, 8)}`);
     await fs.rename(temporary, dir);

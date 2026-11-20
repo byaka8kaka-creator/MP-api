@@ -23,10 +23,18 @@ port.on('message', async ({ data }) => {
   }
   if (action === 'export') {
     try {
-      const output = await exportRun(store, store.run(runId), data.format);
+      const { processing, sourceIndex } = data;
+      const output = await exportRun(store, store.run(runId), data.format, { processing, sourceIndex });
       const latest = store.run(runId);
-      latest.progress.exportPath = output;
-      delete latest.progress.exportError;
+      if (processing) {
+        latest.progress.processingExports ??= {};
+        latest.progress.processingExports[`${sourceIndex}:${processing.id}`] = {
+          name: processing.name, path: output, format: data.format,
+        };
+      } else {
+        latest.progress.exportPath = output;
+        delete latest.progress.exportError;
+      }
       store.updateRun(runId, latest.state, latest.progress);
       port.postMessage({ event: 'exported', requestId });
     } catch (error) {

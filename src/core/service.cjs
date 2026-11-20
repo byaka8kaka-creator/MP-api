@@ -4,6 +4,7 @@ const path = require('node:path');
 const { InputError, object, publicValue, readJson, stringify } = require('./json.cjs');
 const { demand, folder, id, inputValues, profileFor, text, validateConnection, validateTemplate } = require('./model.cjs');
 const { generalLog, logEvent, logTail, preview, referenceValues, runLog, sample } = require('./datasets.cjs');
+const { FUNNEL_COLUMNS, FUNNEL_NAME, isFunnel, validateProcessing } = require('./processings.cjs');
 const { scheduleDecision, validateSchedule } = require('./schedule.cjs');
 
 function canConfigure(user) {
@@ -54,6 +55,8 @@ class Service {
     const editor = canConfigure(user);
     const all = store.templates();
     const connections = store.connections();
+    const visible = all.filter(record => record.published && (editor || record.published.available));
+    const visibleIds = new Set(visible.map(record => record.id));
     return {
       user,
       jobs: store.jobs(user.role === 'admin' ? null : user.id).map(item => ({
@@ -61,12 +64,14 @@ class Service {
       })),
       runs: store.runs(user.role === 'admin' ? null : user.id),
       folders: store.folders().filter(row => row.kind === 'job' ? row.scope === user.id : editor),
-      options: all.filter(record => record.published && (editor || record.published.available)).map(record => {
+      options: visible.map(record => {
         const option = formTemplate(record.published, record.version);
         const connection = connections.find(item => item.id === option.connectionId);
         const endpoint = connection?.endpoints.find(item => item.id === record.published.endpointId);
-        return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox) };
+        return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), supportsFunnel: isFunnel(record.published) };
       }),
+      processings: store.processings().filter(item => visibleIds.has(item.templateId)),
+      funnelDefaults: editor ? { name: FUNNEL_NAME, columns: FUNNEL_COLUMNS } : null,
       connections: editor ? connections : [],
       templates: editor ? all.map(item => ({
         id: item.id, version: item.version, draft: publicValue(item.draft), draftJson: stringify(item.draft, null, 2),
@@ -85,6 +90,33 @@ class Service {
     const name = folder(value.path);
     demand(name, 'Введите имя папки.');
     this.store.putFolder(value.kind, workspace, name);
+  }
+
+  saveProcessing(user, value) {
+    demand(canConfigure(user), 'Обработки редактирует настройщик.');
+    const processingId = value.id ? id(value.id) : randomUUID();
+    const previous = this.store.processing(processingId);
+    const templateId = id(value.templateId);
+    demand(!previous || previous.templateId === templateId, 'Создайте отдельную обработку для другого шаблона.');
+    const template = this.store.template(templateId)?.published;
+    const processing = validateProcessing({ ...value, id: processingId }, template);
+    this.store.putProcessing(processing);
+    return processingId;
+  }
+
+  processingFor(user, processingId, template) {
+    const config = this.store.processing(id(processingId));
+    demand(config, 'Обработка отсутствует.');
+    demand(canConfigure(user) || this.store.template(config.templateId)?.published?.available, 'Обработка недоступна.');
+    return validateProcessing(config, template);
+  }
+
+  processingFromRun(user, run, value) {
+    const index = value.source;
+    demand(Number.isInteger(index) && run.snapshot.sources[index], 'Выберите источник данных.');
+    const progress = run.progress.sources?.[index];
+    demand(progress?.rows > 0 || progress?.state === 'completed', 'В этом источнике нет сохранённых строк.');
+    return { sourceIndex: index, processing: this.processingFor(user, value.processingId, run.snapshot.sources[index].template) };
   }
 
   saveConnection(user, raw) {
@@ -231,6 +263,7 @@ class Service {
     const environment = entry.environment ?? 'production';
     demand(['production', 'sandbox'].includes(environment), 'Выберите рабочую или тестовую среду.');
     const source = { template, connection, environment, version: draft ? null : record.version, references: {} };
+    if (entry.processingId) source.processing = this.processingFor(user, entry.processingId, template);
     const { endpoint, profile } = profileFor(source);
     demand(environment !== 'sandbox' || endpoint.sandbox, 'В подключении отсутствует адрес песочницы.');
     const inputs = typeof entry.values === 'string' ? readJson(entry.values, 'Параметры запуска') : entry.values ?? {};
@@ -256,6 +289,7 @@ class Service {
     const runDay = new Date();
     const entries = value.entries.map(item => {
       const entry = { templateId: id(item.templateId), environment: item.environment ?? 'production', values: item.values ?? '{}' };
+      if (item.processingId) entry.processingId = id(item.processingId);
       this.source(owner, entry, false, runDay);
       return entry;
     });
@@ -305,6 +339,7 @@ class Service {
     return {
       ...summary, sources: snapshot.sources.map(source => ({
         name: source.template.name, version: source.version, environment: source.environment,
+        templateId: source.template.id, processingName: source.processing?.name, supportsFunnel: isFunnel(source.template),
         values: stringify(source.resolved ?? source.values, null, 2),
       })),
     };

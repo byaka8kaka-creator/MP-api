@@ -228,6 +228,8 @@ async function actions(action, value) {
       return service.saveFolder(user, value);
     case 'job':
       return service.saveJob(user, value);
+    case 'processing':
+      return service.saveProcessing(user, value);
     case 'run': {
       demand(!quitting && workerReady, 'Рабочий процесс сейчас недоступен.');
       const id = service.createRun(user, value);
@@ -253,10 +255,11 @@ async function actions(action, value) {
       const run = service.getRun(user, value.runId);
       demand(!activeStates.has(run.state) && workerReady && !quitting, 'Дождитесь завершения задания.');
       demand(['csv', 'xlsx'].includes(value.format), 'Выберите CSV или XLSX.');
+      const output = value.processingId ? service.processingFromRun(user, run, value) : {};
       const requestId = randomUUID();
       return new Promise((resolve, reject) => {
         exportsInFlight.set(requestId, { resolve, reject });
-        try { worker.postMessage({ action: 'export', requestId, runId: run.id, format: value.format }); }
+        try { worker.postMessage({ action: 'export', requestId, runId: run.id, format: value.format, ...output }); }
         catch {
           exportsInFlight.delete(requestId);
           reject(new InputError('Рабочий процесс недоступен.'));
@@ -265,8 +268,11 @@ async function actions(action, value) {
     }
     case 'openOutput': {
       const run = service.getRun(user, value.runId);
-      demand(run.progress.exportPath, 'Для этого запуска ещё нет файлов экспорта.');
-      demand(!await shell.openPath(run.progress.exportPath), 'Не удалось открыть папку экспорта.');
+      const output = value.processingId
+        ? run.progress.processingExports?.[`${value.source}:${id(value.processingId)}`]?.path
+        : run.progress.exportPath;
+      demand(output, 'Для этого результата ещё нет файлов экспорта.');
+      demand(!await shell.openPath(output), 'Не удалось открыть папку экспорта.');
       return null;
     }
     case 'pin': {

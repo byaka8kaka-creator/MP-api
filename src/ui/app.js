@@ -218,8 +218,8 @@ async function logout() {
 function render() {
   if (!state.user || state.user.must_change || !state.workspace) { root.replaceChildren(loginPage()); return; }
   const workspace = state.workspace;
-  const nav = [['jobs', 'Выгрузки'], ['api', 'API-запросы'], ['logs', 'Журнал'], ['settings', 'Настройки']];
-  const route = { jobs: jobPage, api: apiPage, logs: logPage, settings: settingsPage };
+  const nav = [['jobs', 'Выгрузки'], ['api', 'API-запросы'], ['processings', 'Обработки'], ['logs', 'Журнал'], ['settings', 'Настройки']];
+  const route = { jobs: jobPage, api: apiPage, processings: processingPage, logs: logPage, settings: settingsPage };
   const sidebar = h('aside', { class: 'sidebar' }, brand(),
     h('nav', { class: 'navigation', 'aria-label': 'Разделы' }, nav.filter(([id]) => id !== 'api' || state.user.role !== 'user').map(([id, label]) =>
       h('button', { type: 'button', 'aria-current': state.page === id ? 'page' : undefined, onclick: () => {
@@ -492,7 +492,7 @@ function dictionaryPicker(templateId, param, draft, pick) {
 }
 
 function jobEditor(job) {
-  const { options } = state.workspace;
+  const { options, processings } = state.workspace;
   const name = input(job?.name, { required: true, maxlength: 160 });
   const folder = input(job?.folder, { maxlength: 250, placeholder: 'Рабочие / Заказы' });
   const format = select([['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV']], job?.format ?? 'xlsx');
@@ -520,8 +520,16 @@ function jobEditor(job) {
       }
       const env = select([['production', 'Рабочая'], ['sandbox', 'Песочница', !template.sandbox]], previous?.environment ?? 'production');
       const params = parameterValues(template, previous?.values);
-      settings.replaceChildren(template.sandbox ? field('Среда API', env) : '', params.node);
-      item.value = () => ({ templateId: template.id, environment: env.value, values: params.value() });
+      const available = template.supportsFunnel ? processings.filter(item => item.templateId === template.id) : [];
+      const modes = [['', 'Без обработки'], ...available.map(item => [item.id, item.name])];
+      if (previous?.processingId && !available.some(item => item.id === previous.processingId)) {
+        modes.push([previous.processingId, 'Сохранённая обработка недоступна', true]);
+      }
+      const processing = select(modes, previous?.processingId ?? '');
+      settings.replaceChildren(template.sandbox ? field('Среда API', env) : '',
+        modes.length > 1 ? field('Обработка', processing) : '', params.node);
+      item.value = () => ({ templateId: template.id, environment: env.value, values: params.value(),
+        processingId: processing.value || undefined });
     }
     selected.addEventListener('change', () => bind());
     bind(entry);
@@ -539,6 +547,47 @@ function jobEditor(job) {
       schedule: enabled.control.checked ? { days: days.filter(([, item]) => item.control.checked).map(([day]) => day), time: scheduledTime.value } : null,
     });
     await done('Выгрузка сохранена.');
+  });
+}
+
+function processingPage(workspace) {
+  const editor = state.user.role !== 'user';
+  const supported = workspace.options.some(option => option.supportsFunnel);
+  return [
+    header('Обработки', 'Подготовьте данные для Excel или CSV. Обработку можно добавить в новую выгрузку или применить к результату в журнале.',
+      editor && btn('Новая обработка', () => processingEditor(), 'primary', !supported)),
+    section('Сохранённые обработки', null,
+      workspace.processings.length
+        ? table(['Обработка', 'Шаблон запроса', 'Колонки', 'Действия'], workspace.processings.map(processing => {
+          const template = workspace.options.find(option => option.id === processing.templateId);
+          return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, processing.name),
+            h('small', {}, 'Воронка Wildberries · Строка на период')),
+          h('td', {}, template?.name),
+          h('td', {}, number.format(processing.columns.length)),
+          h('td', {}, cluster(editor && btn('Изменить', () => processingEditor(processing), 'compact'),
+            btn('История запусков', () => { state.page = 'logs'; render(); }, 'compact'))));
+        }))
+        : h('div', { class: 'empty' }, editor && !supported
+          ? 'Опубликуйте шаблон /api/analytics/v3/sales-funnel/products с путём к строкам data.products.'
+          : 'Сохранённых обработок пока нет.')),
+  ];
+}
+
+function processingEditor(saved) {
+  const { options, funnelDefaults } = state.workspace;
+  const choices = options.filter(item => item.supportsFunnel || item.id === saved?.templateId);
+  const template = select(choices.map(item => [item.id, item.name]), saved?.templateId);
+  template.disabled = Boolean(saved);
+  const name = input(saved?.name ?? funnelDefaults.name, { required: true, maxlength: 160 });
+  const columns = textarea(pretty(saved?.columns ?? funnelDefaults.columns), 11, 'Колонки результата');
+  formModal(saved ? 'Изменить обработку' : 'Новая обработка', [
+    fields(field('Название', name), field('Шаблон запроса', template)),
+    h('p', { class: 'caption' }, 'Воронка Wildberries создаёт для каждой карточки строку текущего периода и строку предыдущего периода, если он есть.'),
+    h('details', { class: 'fold' }, h('summary', {}, 'Колонки результата'), columns),
+  ], 'Сохранить', async () => {
+    await call('processing', { id: saved?.id, templateId: template.value, name: name.value,
+      columns: editedJson(columns.value, 'Колонки результата') });
+    await done('Обработка сохранена.');
   });
 }
 
@@ -810,12 +859,22 @@ async function runDetails(runId) {
   const logs = btn('Открыть журнал', () => showLogs({ runId }));
   const results = run.sources.map((source, index) => {
     const progress = run.progress.sources?.[index] ?? {};
+    const available = state.workspace.processings.filter(item => item.templateId === source.templateId);
+    const ready = !active.has(run.state) && (progress.rows > 0 || progress.state === 'completed');
+    const saved = Object.entries(run.progress.processingExports ?? {}).filter(([key]) => key.startsWith(`${index}:`));
     return h('div', { class: 'source-card' }, cluster(h('h3', {}, source.name), progress.state && pill(progress.state)),
       h('p', { class: 'caption' }, `${source.version ? `Версия ${source.version}` : 'Черновик'} · ${source.environment === 'sandbox' ? 'Песочница' : 'Рабочая среда'} · Строк ${number.format(progress.rows ?? 0)}`),
+      source.processingName && h('small', { class: 'caption' }, `Обработка · ${source.processingName}`),
       progress.error && h('p', { class: 'notice error' }, progress.error),
       progress.warning && h('p', { class: 'notice' }, progress.warning),
       source.values && h('details', { class: 'fold' }, h('summary', {}, 'Параметры запуска'), h('pre', { class: 'pre mono' }, source.values)),
-      progress.rows > 0 && cluster(btn('Просмотр строк', () => showPreview(runId, index, 0), 'compact')));
+      cluster(progress.rows > 0 && btn('Просмотр строк', () => showPreview(runId, index, 0), 'compact'),
+        source.supportsFunnel && ready && available.length > 0 &&
+          btn('Применить обработку', () => processSavedRun(runId, index, available), 'compact')),
+      saved.map(([key, output]) => cluster(h('small', { class: 'caption' }, `${output.name} · ${output.format.toUpperCase()}`),
+        btn('Открыть обработанные файлы', () => call('openOutput', {
+          runId, source: index, processingId: key.split(':')[1],
+        }), 'compact'))));
   });
   const hasResults = Object.values(run.progress.sources ?? {}).some(source => source.rows > 0 || source.state === 'completed');
   async function exportFile(format) {
@@ -839,6 +898,17 @@ async function runDetails(runId) {
     hasResults && !active.has(run.state) && btn('CSV', () => exportFile('csv')),
     run.progress.exportPath && btn('Открыть папку файлов', () => call('openOutput', { runId }), 'primary'),
   ]);
+}
+
+function processSavedRun(runId, source, choices) {
+  const processing = select(choices.map(item => [item.id, item.name]));
+  const format = select([['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV']]);
+  formModal('Обработать сохранённый результат', fields(field('Обработка', processing), field('Формат результата', format)),
+    'Создать файл', async () => {
+      await call('export', { runId, source, processingId: processing.value, format: format.value });
+      await runDetails(runId);
+      showToast('Файл обработки готов.');
+    });
 }
 
 async function showPreview(runId, source, offset) {

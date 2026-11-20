@@ -9,6 +9,7 @@ const { exportRun, logTail, runLog, sample, writePage } = require('../src/core/d
 const { parseJson, stringify } = require('../src/core/json.cjs');
 const { LimitScheduler } = require('../src/core/limits.cjs');
 const { batches, inputValues, requestFor, validateConnection, validateTemplate } = require('../src/core/model.cjs');
+const { FUNNEL_COLUMNS, FUNNEL_PATH } = require('../src/core/processings.cjs');
 const { executeRun } = require('../src/core/runner.cjs');
 const { DEFER_MS, scheduleDecision } = require('../src/core/schedule.cjs');
 const { Service } = require('../src/core/service.cjs');
@@ -354,4 +355,72 @@ test('относительные даты разрешаются во вложе
     period: { start: new Date(2026, 2, 7, 9, 30).toISOString(), days: ['2026-02-28', '2026-03-08'] },
   });
   assert.throws(() => inputValues(template, { period: { days: [{ daysFromRun: 0.5 }] } }, false, day), /целое смещение/);
+});
+
+test('обработка воронки разворачивает периоды в новые строки из сохранённых и свежих данных', async t => {
+  const responses = JSON.stringify({ data: { products: [
+    { product: { nmId: '9007199254740993', title: 'Карточка', vendorCode: '0001', brandName: 'Марка', stocks: { balanceSum: 12 } },
+      statistic: {
+        selected: { period: { start: '2026-11-18', end: '2026-11-19' }, orderCount: 0, timeToReady: { days: 1 },
+          wbClub: { orderCount: 0 }, conversions: { buyoutPercent: 76 } },
+        past: { period: { start: '2026-11-16', end: '2026-11-17' }, orderCount: 5 },
+        comparison: { orderCountDynamic: 100 },
+      } },
+    { product: { nmId: 222, title: 'Вторая карточка' }, statistic: {
+      selected: { period: { start: '2026-11-18', end: '2026-11-19' } }, past: {},
+    } },
+  ] } });
+  const fx = await fixture(t, () => ({ body: responses }));
+  const { service, user, store } = fx;
+  const draft = service.saveDraft(user, stringify({
+    id: 'funnel', name: 'Исходная статистика', connectionId: 'wildberries', endpointId: 'marketplace',
+    method: 'POST', path: FUNNEL_PATH, available: true, response: { rows: 'data.products',
+      columns: [{ name: 'Статистика (JSON)', path: 'statistic' }] },
+  }));
+  service.publish(user, draft);
+  const processingId = service.saveProcessing(user, { templateId: draft, name: 'Разворот воронки' });
+  const originalJob = service.saveJob(user, {
+    name: 'Исходник', format: 'csv', entries: [{ templateId: draft }],
+  });
+  const originalId = service.createRun(user, { kind: 'job', jobId: originalJob });
+  await fx.run(originalId);
+  const raw = store.run(originalId);
+  const variant = service.processingFromRun(user, raw, { processingId, source: 0 });
+  const output = await exportRun(store, raw, 'xlsx', variant);
+  assert.equal(fx.requests.length, 1);
+  assert.ok(await fs.stat(raw.progress.exportPath));
+  const meta = JSON.parse(await fs.readFile(path.join(output, 'результат.json'), 'utf8'));
+  assert.deepEqual(meta.tables, [{ name: 'Разворот воронки', rows: 3 }]);
+  const workbook = new ExcelJS.Workbook();
+  const filename = (await fs.readdir(output)).find(name => name.endsWith('.xlsx'));
+  await workbook.xlsx.readFile(path.join(output, filename));
+  const sheet = workbook.worksheets[0];
+  assert.deepEqual(sheet.getRow(1).values.slice(1), FUNNEL_COLUMNS.map(column => column.name));
+  assert.equal(sheet.rowCount, 4);
+  const cell = (row, field) => sheet.getRow(row).getCell(FUNNEL_COLUMNS.findIndex(column => column.path === field) + 1).value;
+  assert.deepEqual(sheet.getRow(2).values.slice(1, 9),
+    ['9007199254740993', 'Карточка', '0001', 'Марка', 12, 'Текущий', '2026-11-18', '2026-11-19']);
+  assert.deepEqual(sheet.getRow(3).values.slice(1, 9),
+    ['9007199254740993', 'Карточка', '0001', 'Марка', 12, 'Предыдущий', '2026-11-16', '2026-11-17']);
+  assert.equal(cell(2, 'statistic.orderCount'), 0);
+  assert.equal(cell(3, 'statistic.orderCount'), 5);
+  assert.equal(cell(2, 'statistic.timeToReady.days'), 1);
+  assert.equal(cell(2, 'statistic.conversions.buyoutPercent'), 76);
+  assert.equal(cell(3, 'statistic.conversions.buyoutPercent'), null);
+  assert.equal(cell(4, 'product.nmId'), 222);
+
+  const processedJob = service.saveJob(user, { name: 'Обработанные данные', format: 'csv',
+    entries: [{ templateId: draft, processingId }, { templateId: draft }] });
+  const processedId = service.createRun(user, { kind: 'job', jobId: processedJob });
+  service.saveProcessing(user, { id: processingId, templateId: draft, name: 'Другое имя', columns: FUNNEL_COLUMNS.slice(0, 5) });
+  await fx.run(processedId);
+  const processed = store.run(processedId);
+  assert.equal(processed.state, 'completed');
+  const info = JSON.parse(await fs.readFile(path.join(processed.progress.exportPath, 'результат.json'), 'utf8'));
+  assert.deepEqual(info.tables, [
+    { name: 'Разворот воронки', rows: 3 }, { name: 'Исходная статистика', rows: 2 },
+  ]);
+  const preview = await service.result(user, { runId: processedId, source: 0, offset: 0 });
+  assert.equal(preview.rows.length, 3);
+  assert.equal(preview.rows[1].periodType, 'Предыдущий');
 });

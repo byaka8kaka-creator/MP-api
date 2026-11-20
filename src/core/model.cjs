@@ -572,5 +572,5 @@ function historyWarning(template, values, now = new Date()) {
     : null;
 }
 
-module.exports = { batches, clone, demand, folder, historyWarning, id, initialPosition, inputValues, methods,
+module.exports = { batches, clone, columns, dateMs, demand, folder, historyWarning, id, initialPosition, inputValues, methods,
   nextPosition, positive, profileFor, requestFor, responseRows, text, validateConnection, validateTemplate };
