@@ -174,7 +174,7 @@ async function resolveInputs(store, run, source, signal) {
     } else {
       demand(inputRun?.state === 'completed', 'Сохранённая версия справочника недоступна.');
     }
-    const input = referenceValues(store, inputRun, reference, index, signal);
+    const input = referenceValues(store, inputRun, reference, index, signal, values);
     if (reference.mode === 'all') {
       const items = new Map();
       for await (const value of input) {
@@ -267,7 +267,7 @@ async function executeSource(store, run, index, secrets, context, update) {
           await saveSample(store, run.id, index, http.raw);
           if (previewOnly) store.linkSample(source.template.id, run.id);
         }
-        const rows = responseRows(source.template.response, http.payload, http.status);
+        const rows = responseRows(source.template.response, http.payload, http.status, values);
         batchRows += rows.length;
         let next = null;
         let incomplete = null;

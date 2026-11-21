@@ -867,7 +867,8 @@ function templateEditor(connection, record) {
   const advanced = textarea(pretty({ maxBodyBytes: draft.maxBodyBytes, maxResponseBytes: draft.maxResponseBytes, timeoutMs: draft.timeoutMs }),
     4, 'Размеры и тайм-аут');
   const parameterName = input('', { placeholder: 'Имя' });
-  const parameterLocation = select([['query', 'Строка запроса'], ['body', 'JSON-тело'], ['path', 'Путь'], ['header', 'Заголовок']]);
+  const parameterLocation = select([['query', 'Строка запроса'], ['body', 'JSON-тело'], ['path', 'Путь'],
+    ['header', 'Заголовок'], ['input', 'Форма запуска']]);
   const parameterType = select(['string', 'integer', 'number', 'boolean', 'date', 'datetime', 'array', 'object'].map(value => [value, value]));
   const parameterRequired = checkbox('Обязательный');
   const columnPath = input('', { placeholder: 'address.fullAddress' });

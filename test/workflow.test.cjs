@@ -559,6 +559,69 @@ test('медиакампании запрашиваются по одному ID
   assert.deepEqual(banners.getSheetValues().slice(2), [[, 23569, 68080, 0], [, 23569, 68081, 351]]);
 });
 
+test('статистика WB Медиа передаёт корневой массив с датами и сохраняет ID кампании', async t => {
+  const listPath = '/adv/v1/adverts';
+  const statsPath = '/adv/v1/stats';
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === listPath) return { body: '[{"advertId":23569},{"advertId":24680},{"advertId":23569}]' };
+    const [{ id, dates }] = JSON.parse(request.body);
+    const response = id === 23569 ? [{ dates, stats: [{ item_id: 68080, views: 30, clicks: 0 }] }]
+      : [{ advertId: id, error: 'Кампания не найдена' }];
+    return { body: JSON.stringify(response) };
+  });
+  const { service, store, user, requests } = fx;
+  const connection = { connectionId: 'wildberries', endpointId: 'marketplace' };
+  const listId = service.saveDraft(user, stringify({ ...connection, name: 'Список медиакампаний',
+    method: 'GET', path: listPath, response: { rows: '$' } }));
+  service.publish(user, listId);
+  const dates = { type: 'array', items: { type: 'date', required: true }, required: true, minItems: 1 };
+  const campaigns = { name: 'campaigns', where: 'body', key: '$', type: 'array', required: true, minItems: 1, batchSize: 1,
+    items: { type: 'object', properties: { id: { type: 'integer', required: true }, dates } } };
+  const config = { ...connection, name: 'Статистика медиа', method: 'POST', path: statsPath, parameters: [campaigns], response: {
+    rows: '$', requestFields: { campaignId: 'campaigns.0.id' },
+    columns: [{ path: 'request.campaignId', name: 'ID кампании' }, { path: 'error', name: 'Ошибка' }],
+    tables: [{ name: 'Баннеры', path: 'stats', columns: [
+      { path: '$parent.request.campaignId', name: 'ID кампании' }, { path: 'item_id', name: 'ID баннера' },
+      { path: 'views', name: 'Просмотры' }, { path: 'clicks', name: 'Клики' },
+    ] }],
+  } };
+  const templateId = service.saveDraft(user, stringify(config));
+  const previewId = service.createRun(user, { kind: 'test', entry: { templateId,
+    values: '{"campaigns":[{"id":23569,"dates":["2026-11-19",{"daysFromRun":-1}]}]}' } }, new Date(2026, 10, 21, 12).getTime());
+  await fx.run(previewId);
+  assert.equal(store.run(previewId).state, 'completed');
+  assert.deepEqual(JSON.parse(requests[0].body), [{ id: 23569, dates: ['2026-11-19', '2026-11-20'] }]);
+  assert.equal(JSON.parse((await service.testSample(user, templateId)).text)[0].request, undefined);
+
+  const linked = { ...campaigns, reference: {
+    templateId: listId, mode: 'all', refresh: 'run', fields: { id: 'advertId', dates: '$input.dates' },
+  } };
+  const form = { ...dates, name: 'dates', where: 'input' };
+  assert.throws(() => service.saveDraft(user, stringify({ ...config, parameters: [linked] })), /параметр формы/);
+  assert.throws(() => service.saveDraft(user, stringify({ ...config, parameters: [form, { ...linked, batchSize: 100 }] })), /batchSize 1/);
+  assert.throws(() => service.saveDraft(user, stringify({ ...config, parameters: [campaigns, { ...form, where: 'body' }] })),
+    /единственным параметром тела/);
+  service.saveDraft(user, stringify({ ...config, id: templateId, parameters: [form, linked] }));
+  service.publish(user, templateId);
+  requests.length = 0;
+
+  const jobId = service.saveJob(user, { name: 'Медиа', format: 'xlsx', entries: [{ templateId,
+    values: '{"dates":[{"daysFromRun":-2},{"daysFromRun":-1}]}' }] });
+  const runId = service.createRun(user, { kind: 'job', jobId }, new Date(2026, 10, 22, 12).getTime());
+  await fx.run(runId);
+  const run = store.run(runId);
+  assert.equal(run.state, 'completed');
+  assert.deepEqual(requests.map(request => request.url.pathname), [listPath, statsPath, statsPath]);
+  assert.deepEqual(requests.slice(1).map(request => JSON.parse(request.body)),
+    [23569, 24680].map(id => [{ id, dates: ['2026-11-20', '2026-11-21'] }]));
+  assert.ok(requests.slice(1).every(request => request.method === 'POST' && request.headers['content-type'] === 'application/json'));
+  const files = await fs.readdir(run.progress.exportPath);
+  const book = new ExcelJS.Workbook();
+  await book.xlsx.readFile(path.join(run.progress.exportPath, files.find(filename => filename.endsWith('.xlsx'))));
+  assert.equal(book.getWorksheet('Статистика медиа').getCell('B3').value, 'Кампания не найдена');
+  assert.deepEqual(book.getWorksheet('Баннеры').getRow(2).values.slice(1), [23569, 68080, 30, 0]);
+});
+
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
   let mode = 'empty';
   const countPath = '/adv/v1/promotion/count';

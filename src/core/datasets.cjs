@@ -127,13 +127,18 @@ async function preview(store, run, source, offset) {
   return { rows: rows.slice(0, 30), more: rows.length > 30 };
 }
 
-async function* referenceValues(store, run, reference, index = 0, signal) {
+async function* referenceValues(store, run, reference, index = 0, signal, inputs) {
   for await (const row of records(store, run, index, signal)) {
     const items = reference.expand === undefined ? [row] : get(row, reference.expand);
     demand(Array.isArray(items), `В ответе зависимого запроса отсутствует массив «${reference.expand}».`);
     for (const item of items) {
       if (reference.fields) {
         const fields = Object.entries(reference.fields).map(([name, path]) => {
+          if (path.startsWith('$input.')) {
+            const value = get(inputs, path.slice(7));
+            demand(value !== undefined, `Заполните параметр формы «${path.slice(7)}».`);
+            return [name, value];
+          }
           const value = path.startsWith('$parent.') ? get(row, path.slice(8)) : get(item, path);
           demand(value !== undefined, `В ответе зависимого запроса отсутствует поле «${path}».`);
           return [name, value];

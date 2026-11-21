@@ -143,16 +143,21 @@ function parameter(value, depth = 0) {
 }
 
 function parameterList(value, profiles, template) {
-  return distinct(optionalList(value, 'Параметры').map(spec => {
+  const specs = optionalList(value, 'Параметры');
+  return distinct(specs.map(spec => {
     const result = parameter(spec);
     result.name = id(spec.name);
     result.label = text(spec.label ?? spec.name, 'имя поля');
-    demand(['path', 'query', 'body', 'header'].includes(spec.where), 'Укажите расположение каждого параметра.');
+    demand(['path', 'query', 'body', 'header', 'input'].includes(spec.where), 'Укажите расположение каждого параметра.');
     result.where = spec.where;
     result.key = spec.key ?? spec.name;
     if (spec.where === 'body') {
       demand(!['GET', 'HEAD'].includes(template.method), 'GET и HEAD не поддерживают JSON-тело.');
-      demand(pathParts(result.key).length > 0, 'Укажите поле тела запроса.');
+      if (result.key === '$') {
+        demand(result.type === 'array' && !result.nullable, 'Для корня JSON-тела задайте массив.');
+      } else {
+        demand(pathParts(result.key).length > 0, 'Укажите поле тела запроса.');
+      }
     } else {
       text(result.key, 'имя HTTP-параметра');
     }
@@ -176,6 +181,7 @@ function parameterList(value, profiles, template) {
       result.encoding = spec.encoding;
     }
     if (spec.reference !== undefined) {
+      demand(spec.where !== 'input', 'Параметр формы заполняется пользователем или значением по умолчанию.');
       const reference = spec.reference;
       demand(object(reference) && ['one', 'many', 'all'].includes(reference.mode), 'Укажите режим зависимости.');
       demand(reference.mode === 'one' || result.type === 'array', 'Для нескольких значений зависимости нужен массив.');
@@ -198,7 +204,13 @@ function parameterList(value, profiles, template) {
         'Для сборки объектов укажите поля объекта вместо одного пути.');
         result.reference.fields = Object.fromEntries(Object.entries(reference.fields).map(([name, path]) => {
           demand(typeof path === 'string', 'Укажите путь каждого поля объекта.');
-          pathParts(path.replace(/^\$parent\./, ''));
+          if (path.startsWith('$input.')) {
+            const [input] = pathParts(path.slice(7));
+            demand(reference.refresh === 'run' && specs.some(spec => spec?.where === 'input' && spec.name === input),
+              'Для ссылки $input укажите параметр формы и обновление при запуске.');
+          } else {
+            pathParts(path.replace(/^\$parent\./, ''));
+          }
           return [id(name), path];
         }));
       }
@@ -280,6 +292,10 @@ function validateTemplate(value, connection) {
     maxResponseBytes: positive(value.maxResponseBytes ?? 32 * 1024 * 1024, 'Максимум байт в ответе', 256 * 1024 * 1024),
     timeoutMs: positive(value.timeoutMs ?? 30_000, 'Тайм-аут запроса', 600_000),
   };
+  if (result.parameters.some(parameter => parameter.where === 'body' && parameter.key === '$')) {
+    demand(result.parameters.filter(parameter => parameter.where === 'body').length === 1 && result.pagination.target !== 'body',
+      'Массив в корне JSON должен быть единственным параметром тела.');
+  }
   demand(['resume', 'restart', 'decision'].includes(result.recovery), 'Неподдерживаемый режим восстановления.');
   demand(result.recovery === 'decision' || result.safeToRetry, 'Восстановление разрешено только для безопасно повторяемых запросов.');
   for (const match of result.path.matchAll(/\{([^}]+)\}/g)) {
@@ -305,6 +321,18 @@ function validateTemplate(value, connection) {
   if (response.singleObject !== undefined) {
     demand(typeof response.singleObject === 'boolean', 'Значение singleObject должно быть логическим.');
     result.response.singleObject = response.singleObject;
+  }
+  if (response.requestFields !== undefined) {
+    demand(object(response.requestFields), 'Укажите поля из параметров запуска как объект.');
+    result.response.requestFields = Object.fromEntries(Object.entries(response.requestFields).map(([name, path]) => {
+      const [parameter, element] = pathParts(path);
+      const spec = result.parameters.find(spec => spec.name === parameter);
+      demand(spec, 'Укажите путь к существующему параметру запуска.');
+      if (spec.type === 'array' && element !== undefined) {
+        demand(spec.batchSize === 1 && element === '0', 'Для поля элемента массива в ответе укажите batchSize 1 и путь к элементу 0.');
+      }
+      return [id(name), path];
+    }));
   }
   if (response.success !== undefined) {
     demand(object(response.success) && Object.hasOwn(response.success, 'equals'), 'Укажите ожидаемое значение поля успеха.');
@@ -437,7 +465,7 @@ function requestFor(source, values, position, credentials = null) {
   let relative = template.path;
   const query = new URLSearchParams();
   const headers = new Headers({ accept: 'application/json' });
-  const body = {};
+  let body = {};
   const add = (where, key, value, encoding) => {
     if (where === 'body') set(body, key, value);
     if (where === 'header') headers.set(key, scalarText(value));
@@ -457,10 +485,11 @@ function requestFor(source, values, position, credentials = null) {
   };
   for (const spec of template.parameters) {
     let value = values[spec.name];
-    if (value === undefined) continue;
+    if (value === undefined || spec.where === 'input') continue;
     if (value !== null && spec.format === 'unix-start') value = dateMs(value) / 1000;
     if (value !== null && spec.format === 'unix-end') value = (dateMs(value) + DAY) / 1000 - 1;
-    add(spec.where, spec.key, value, spec.encoding);
+    if (spec.where === 'body' && spec.key === '$') body = value;
+    else add(spec.where, spec.key, value, spec.encoding);
   }
   if (position.value !== undefined) add(template.pagination.target, template.pagination.parameter, position.value);
   const origin = baseUrl(base);
@@ -477,12 +506,13 @@ function requestFor(source, values, position, credentials = null) {
     }
   }
   let serialized;
-  if (Object.keys(body).length || template.parameters.some(spec => spec.where === 'body')) {
+  const bodyFields = Array.isArray(body) ? ['$'] : Object.keys(body);
+  if (bodyFields.length || template.parameters.some(spec => spec.where === 'body' && spec.key !== '$')) {
     headers.set('content-type', 'application/json');
     serialized = stringify(body);
   }
   const logPath = position.link ? '/[next-page-path]' : new URL(template.path.slice(1), basePath).pathname;
-  return { url, method: template.method, headers, body: serialized, logPath, bodyFields: Object.keys(body) };
+  return { url, method: template.method, headers, body: serialized, logPath, bodyFields };
 }
 
 function* batches(source, values) {
@@ -529,19 +559,30 @@ function* batches(source, values) {
   }
 }
 
-function responseRows(response, payload, httpStatus) {
+function responseRows(response, payload, httpStatus, values) {
   if (httpStatus === 204 && response.allowNoContent) return [];
   if (response.success) {
     const success = get(payload, response.success.path);
     demand(success !== undefined && stringify(success) === stringify(response.success.equals), 'API сообщил об ошибке в теле ответа.');
   }
   const records = get(payload, response.rows);
+  let rows = records;
   if (response.singleObject) {
     demand(object(records), 'В ответе отсутствует настроенный объект записи.');
-    return [records];
+    rows = [records];
+  } else {
+    demand(Array.isArray(records), 'В ответе отсутствует настроенный массив записей.');
   }
-  demand(Array.isArray(records), 'В ответе отсутствует настроенный массив записей.');
-  return records;
+  if (!response.requestFields || !rows.length) return rows;
+  const request = Object.fromEntries(Object.entries(response.requestFields).map(([name, path]) => {
+    const value = get(values, path);
+    demand(value !== undefined, `В параметрах запроса отсутствует поле «${path}».`);
+    return [name, value];
+  }));
+  return rows.map(row => {
+    demand(object(row) && !Object.hasOwn(row, 'request'), 'Для сохранения параметров запроса нужна запись со свободным полем request.');
+    return { ...row, request };
+  });
 }
 
 function nextPosition(pagination, payload, rows, position, values, rowCount, currentUrl) {
