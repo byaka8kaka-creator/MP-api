@@ -511,6 +511,54 @@ test('цепочка WB обновляет состав кампаний и от
   assert.deepEqual(store.run(id).snapshot.sources[0].resolved.items.map(item => stringify(item)), expected);
 });
 
+test('медиакампании запрашиваются по одному ID и сохраняются вместе с баннерами', async t => {
+  const listPath = '/adv/v1/adverts';
+  const detailPath = '/adv/v1/advert';
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === listPath) {
+      return { body: '[{"advertId":23569},{"advertId":24680},{"advertId":25791},{"advertId":23569}]' };
+    }
+    const advertId = Number(request.url.searchParams.get('id'));
+    if (advertId === 24680) return { status: 204 };
+    const items = advertId === 23569 ? [{ id: 68080, cpm: 0 }, { id: 68081, cpm: 351 }] : [];
+    return { body: JSON.stringify({ advertId, extended: { expenses: 10000 }, items }) };
+  });
+  const { service, store, user, requests } = fx;
+  const template = { connectionId: 'wildberries', endpointId: 'marketplace', method: 'GET' };
+  const listId = service.saveDraft(user, stringify({ ...template, name: 'Список медиакампаний',
+    path: listPath, response: { rows: '$' } }));
+  service.publish(user, listId);
+  const details = { ...template, name: 'Медиакампании', path: detailPath, response: {
+    rows: '$', singleObject: true, allowNoContent: true,
+    columns: [{ path: 'advertId', name: 'ID кампании' }, { path: 'extended.expenses', name: 'Расходы' }],
+    tables: [{ name: 'Баннеры', path: 'items', columns: [
+      { path: '$parent.advertId', name: 'ID кампании' }, { path: 'id', name: 'ID баннера' }, { path: 'cpm', name: 'CPM' },
+    ] }],
+  } };
+  const detailId = service.saveDraft(user, stringify({ ...details, parameters: [{
+    name: 'id', where: 'query', type: 'array', items: { type: 'integer', min: 1 }, required: true, batchSize: 1, encoding: 'csv',
+    reference: { templateId: listId, mode: 'all', refresh: 'run', path: 'advertId' },
+  }] }));
+  service.publish(user, detailId);
+
+  const jobId = service.saveJob(user, { name: 'Медиа', format: 'xlsx', entries: [{ templateId: detailId }] });
+  const runId = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(runId);
+  assert.deepEqual(requests.map(({ url }) => url.pathname + url.search),
+    [listPath, `${detailPath}?id=23569`, `${detailPath}?id=24680`, `${detailPath}?id=25791`]);
+  assert.ok(requests.every(request => request.method === 'GET' && request.body === ''));
+  const run = store.run(runId);
+  assert.equal(run.state, 'completed');
+  assert.equal(run.progress.sources[0].rows, 2);
+  const files = await fs.readdir(run.progress.exportPath);
+  const book = new ExcelJS.Workbook();
+  await book.xlsx.readFile(path.join(run.progress.exportPath, files.find(filename => filename.endsWith('.xlsx'))));
+  const campaigns = book.getWorksheet('Медиакампании');
+  assert.deepEqual(campaigns.getSheetValues().slice(2), [[, 23569, 10000], [, 25791, 10000]]);
+  const banners = book.getWorksheet('Баннеры');
+  assert.deepEqual(banners.getSheetValues().slice(2), [[, 23569, 68080, 0], [, 23569, 68081, 351]]);
+});
+
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
   let mode = 'empty';
   const countPath = '/adv/v1/promotion/count';

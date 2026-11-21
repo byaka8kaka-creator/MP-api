@@ -302,6 +302,10 @@ function validateTemplate(value, connection) {
   demand(object(response), 'Настройте извлечение ответа.');
   pathParts(response.rows);
   result.response = { rows: response.rows, columns: columns(response.columns), allowNoContent: response.allowNoContent === true };
+  if (response.singleObject !== undefined) {
+    demand(typeof response.singleObject === 'boolean', 'Значение singleObject должно быть логическим.');
+    result.response.singleObject = response.singleObject;
+  }
   if (response.success !== undefined) {
     demand(object(response.success) && Object.hasOwn(response.success, 'equals'), 'Укажите ожидаемое значение поля успеха.');
     pathParts(response.success.path);
@@ -532,6 +536,10 @@ function responseRows(response, payload, httpStatus) {
     demand(success !== undefined && stringify(success) === stringify(response.success.equals), 'API сообщил об ошибке в теле ответа.');
   }
   const records = get(payload, response.rows);
+  if (response.singleObject) {
+    demand(object(records), 'В ответе отсутствует настроенный объект записи.');
+    return [records];
+  }
   demand(Array.isArray(records), 'В ответе отсутствует настроенный массив записей.');
   return records;
 }

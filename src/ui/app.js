@@ -903,7 +903,8 @@ function templateEditor(connection, record) {
         parameterName.value = '';
       }, 'compact')), parameters),
     fold('Пагинация и период', field('Механизм', mode), pagination, field('Разбиение периода (JSON)', period)),
-    fold('Ответ и колонки', field('Путь к массиву строк', rows, 'Укажите $ для массива в корне ответа.'),
+    fold('Ответ и колонки', field('Путь к массиву строк', rows,
+      'Путь $ выбирает корень ответа. Для одиночного объекта включите singleObject в правилах ниже.'),
       fields(field('Путь поля', columnPath), field('Имя колонки', columnLabel)),
       cluster(btn('Добавить колонку', () => {
         if (!columnLabel.value.trim()) throw new Error('Введите имя колонки.');
