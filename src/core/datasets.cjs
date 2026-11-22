@@ -128,7 +128,10 @@ async function preview(store, run, source, offset) {
 }
 
 async function* referenceValues(store, run, reference, index = 0, signal, inputs) {
+  const { filter } = reference;
+  const allowed = filter && new Set(filter.values.map(value => stringify(value)));
   for await (const row of records(store, run, index, signal)) {
+    if (allowed && !allowed.has(stringify(get(row, filter.path)))) continue;
     const items = reference.expand === undefined ? [row] : get(row, reference.expand);
     demand(Array.isArray(items), `В ответе зависимого запроса отсутствует массив «${reference.expand}».`);
     for (const item of items) {

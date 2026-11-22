@@ -191,6 +191,13 @@ function parameterList(value, profiles, template) {
         demand(reference.refresh !== 'run' || reference.mode === 'all', 'Обновление при запуске требует режима all.');
         result.reference.refresh = reference.refresh;
       }
+      if (reference.filter !== undefined) {
+        const { filter } = reference;
+        demand(object(filter) && Array.isArray(filter.values) && filter.values.length > 0,
+          'Укажите список допустимых значений фильтра зависимого запроса.');
+        pathParts(filter.path);
+        result.reference.filter = { path: filter.path, values: filter.values };
+      }
       if (reference.expand !== undefined) {
         pathParts(reference.expand);
         result.reference.expand = reference.expand;

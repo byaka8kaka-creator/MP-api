@@ -622,6 +622,74 @@ test('статистика WB Медиа передаёт корневой ма�
   assert.deepEqual(book.getWorksheet('Баннеры').getRow(2).values.slice(1), [23569, 68080, 30, 0]);
 });
 
+test('fullstats отбирает статусы до разворота кампаний и делит ID и даты', async t => {
+  const listPath = '/adv/v1/promotion/count';
+  const statsPath = '/adv/v3/fullstats';
+  const ids = Array.from({ length: 51 }, (_, index) => index + 1);
+  let includeEligible = true;
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === listPath) {
+      const groups = [{ status: 4 }, { status: 8, advert_list: [{ advertId: 100 }] }];
+      if (includeEligible) groups.push(
+        { status: 7, advert_list: ids.slice(0, 25).map(advertId => ({ advertId })) },
+        { status: 9, advert_list: ids.slice(25, 50).map(advertId => ({ advertId })) },
+        { status: 11, advert_list: [{ advertId: 51 }, { advertId: 1 }] },
+      );
+      return { body: JSON.stringify({ adverts: groups }) };
+    }
+    const date = request.url.searchParams.get('beginDate');
+    return { body: JSON.stringify(request.url.searchParams.get('ids').split(',').map(id => ({
+      advertId: Number(id), views: 25, days: [{ date, views: 25 }],
+    }))) };
+  });
+  const { service, store, user, requests } = fx;
+  const [listId] = installAdvertising(fx);
+  const { connectionId, endpointId } = store.template(listId).published;
+  const templateId = service.saveDraft(user, stringify({ connectionId, endpointId, name: 'Статистика кампаний WB',
+    method: 'GET', path: statsPath, parameters: [
+      { name: 'ids', where: 'query', type: 'array', items: { type: 'integer', min: 1 }, required: true, batchSize: 50, encoding: 'csv',
+        reference: { templateId: listId, mode: 'all', refresh: 'run', expand: 'advert_list', path: 'advertId',
+          filter: { path: 'status', values: [7, 9, 11] } } },
+      { name: 'beginDate', where: 'query', type: 'date', required: true },
+      { name: 'endDate', where: 'query', type: 'date', required: true },
+    ], period: { from: 'beginDate', to: 'endDate', daysPerRequest: 31 }, response: {
+      rows: '$', requestFields: { beginDate: 'beginDate', endDate: 'endDate' },
+      columns: [{ path: 'advertId', name: 'ID кампании' }, { path: 'request.beginDate', name: 'Начало' },
+        { path: 'request.endDate', name: 'Конец' }],
+      tables: [{ name: 'По дням', path: 'days', columns: [
+        { path: '$parent.advertId', name: 'ID кампании' }, { path: 'date', name: 'Дата' },
+      ] }],
+    } }));
+  service.publish(user, templateId);
+  const jobId = service.saveJob(user, { name: 'Статистика', format: 'xlsx', entries: [{ templateId,
+    values: '{"beginDate":{"daysFromRun":-32},"endDate":"2026-11-02"}' }] });
+  const date = new Date(2026, 10, 2, 12).getTime();
+  const runId = service.createRun(user, { kind: 'job', jobId }, date);
+  await fx.run(runId);
+  assert.deepEqual(requests.map(({ url }) => url.pathname), [listPath, statsPath, statsPath, statsPath, statsPath]);
+  assert.ok(requests.every(request => request.method === 'GET' && request.body === ''));
+  assert.deepEqual(requests.slice(1).map(({ url }) => Object.fromEntries(url.searchParams)),
+    [ids.slice(0, 50), [51]].flatMap(batch => [['2026-10-01', '2026-10-31'], ['2026-11-01', '2026-11-02']]
+      .map(([beginDate, endDate]) => ({ ids: batch.join(','), beginDate, endDate }))));
+  const run = store.run(runId);
+  assert.equal(run.state, 'completed');
+  assert.equal(run.progress.sources[0].rows, 102);
+  const files = await fs.readdir(run.progress.exportPath);
+  const book = new ExcelJS.Workbook();
+  await book.xlsx.readFile(path.join(run.progress.exportPath, files.find(filename => filename.endsWith('.xlsx'))));
+  const main = book.getWorksheet('Статистика кампаний WB');
+  assert.deepEqual(main.getRow(2).values.slice(1), [1, '2026-10-01', '2026-10-31']);
+  assert.deepEqual(main.getRow(52).values.slice(1), [1, '2026-11-01', '2026-11-02']);
+  assert.equal(book.getWorksheet('По дням').rowCount, 103);
+
+  requests.length = 0;
+  includeEligible = false;
+  const emptyId = service.createRun(user, { kind: 'job', jobId }, date);
+  await fx.run(emptyId);
+  assert.deepEqual(requests.map(({ url }) => url.pathname), [listPath]);
+  assert.match(store.run(emptyId).progress.sources[0].warning, /HTTP-запрос пропущен/);
+});
+
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
   let mode = 'empty';
   const countPath = '/adv/v1/promotion/count';
