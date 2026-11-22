@@ -196,12 +196,52 @@ async function resolveInputs(store, run, source, signal) {
   return empty ? { empty } : { values: inputValues(source.template, values) };
 }
 
-async function executeSource(store, run, index, secrets, context, update) {
+function countBatches(source, values, previewOnly) {
+  let count = 0;
+  try {
+    for (const _batch of batches(source, values)) {
+      count++;
+      if (previewOnly) break;
+    }
+  } catch {
+    // Выполнение само сообщит об ошибке в том месте, где план перестаёт формироваться.
+    return null;
+  }
+  return count;
+}
+
+function initialRequests(source, pages, batchCount, previewOnly) {
+  const closed = pages.filter(page => page.status !== 'more').length;
+  const remaining = batchCount === null ? 0 : Math.max(0, batchCount - closed);
+  return {
+    done: pages.length, failed: pages.filter(page => page.status === 'partial').length, remaining,
+    exact: batchCount !== null && (remaining === 0 || previewOnly || source.template.pagination.type === 'none'),
+  };
+}
+
+function prepareRequests(store, run) {
+  return run.snapshot.sources.map((source, index) => {
+    const progress = run.progress.sources[index] ??= { rows: 0, name: source.template.name };
+    if (source.isDependency) progress.isDependency = true;
+    const previewOnly = run.kind === 'test' && !source.isDependency;
+    const pages = store.pages(run.id, index);
+    if (progress.state === 'completed') {
+      progress.requests ??= initialRequests(source, pages, 0, previewOnly);
+      return null;
+    }
+    const unresolved = !source.resolved && source.template.parameters.some(parameter => parameter.reference?.mode === 'all');
+    const count = unresolved ? null : countBatches(source, source.resolved ?? source.values, previewOnly);
+    progress.requests = initialRequests(source, pages, count, previewOnly);
+    return { count, previewOnly };
+  });
+}
+
+async function executeSource(store, run, index, secrets, plan, context, update) {
   const source = run.snapshot.sources[index];
   const progress = run.progress.sources[index];
   const previous = store.pages(run.id, index);
   const credentials = secrets[index] ?? {};
-  const previewOnly = run.kind === 'test' && !source.isDependency;
+  const { count, previewOnly } = plan;
   const trace = (type, fields) => logEvent(store, run.id, type, { source: index + 1, ...fields });
   progress.rows = previous.reduce((total, page) => total + page.rows, 0);
   progress.state = 'running';
@@ -211,11 +251,22 @@ async function executeSource(store, run, index, secrets, context, update) {
     if (resolved.empty) {
       progress.warning = `Зависимый запрос не вернул значений для «${resolved.empty}». HTTP-запрос пропущен.`;
       progress.state = 'completed';
+      progress.requests = initialRequests(source, previous, 0, previewOnly);
       await trace('dependency_empty', { parameter: resolved.empty });
       return;
     }
     source.resolved = resolved.values;
     store.readyRun(run.id, run.snapshot);
+  }
+  if (count === null) {
+    progress.requests = initialRequests(source, previous, countBatches(source, source.resolved, previewOnly), previewOnly);
+    update('running');
+  }
+  const requests = progress.requests;
+  function finishRequest(failed, next) {
+    requests.done++;
+    if (failed) requests.failed++;
+    if (!next) requests.remaining--;
   }
   if (source.secretExpires && source.secretExpires <= Date.now()) throw new InputError('Истёк срок действия ключа подключения.');
   const warning = historyWarning(source.template, source.resolved, new Date(run.created));
@@ -242,6 +293,8 @@ async function executeSource(store, run, index, secrets, context, update) {
     let position = last?.next ?? initialPosition(pagination);
     const seen = new Set([stringify(initialPosition(pagination)), ...saved.filter(page => page.next !== null).map(page => stringify(page.next))]);
     let batchRows = saved.reduce((total, page) => total + page.rows, 0);
+    let attempted = false;
+    if (!requests.remaining) requests.remaining = 1;
     try {
       for (let page = saved.length; ; page++) {
         context.signal?.throwIfAborted();
@@ -253,6 +306,7 @@ async function executeSource(store, run, index, secrets, context, update) {
             update('waiting');
           },
           onRequest: (attempt, request) => {
+            attempted = true;
             delete run.progress.waiting;
             update('running');
             return trace('request', { batch: batchIndex + 1, page: page + 1, attempt, ...request });
@@ -284,6 +338,8 @@ async function executeSource(store, run, index, secrets, context, update) {
         await writePage(store, run.id, index, batchIndex, page, rows);
         store.commitPage(run.id, index, batchIndex, page, next, rows.length,
           incomplete ? 'partial' : next ? 'more' : 'done', incomplete);
+        finishRequest(incomplete, next);
+        attempted = false;
         progress.rows += rows.length;
         progress.page = page + 1;
         update('running');
@@ -295,12 +351,14 @@ async function executeSource(store, run, index, secrets, context, update) {
       }
     } catch (error) {
       context.signal?.throwIfAborted();
+      if (attempted) finishRequest(true, null);
       if (error instanceof HttpProblem && [401, 402, 403].includes(error.status)) throw error;
       errors.push(problem(error));
       await trace('batch_failed', { batch: batchIndex + 1, problem: problem(error) });
     }
     if (previewOnly) break;
   }
+  if (!requests.remaining) requests.exact = true;
   if (errors.length) {
     progress.error = errors[0];
     progress.failedBatches = errors.length;
@@ -321,15 +379,15 @@ async function executeRun(store, runId, secrets, {
   run.progress.sources ??= {};
   const context = { limiter, signal, fetcher, wait };
   await logEvent(store, runId, 'started', { kind: run.kind }, true);
-  update('running');
   let state;
   try {
+    const plans = prepareRequests(store, run);
+    update('running');
     const order = run.snapshot.order ?? run.snapshot.sources.map((_, index) => index);
     for (const index of order) {
       const source = run.snapshot.sources[index];
       signal?.throwIfAborted();
-      const progress = run.progress.sources[index] ??= { rows: 0, name: source.template.name };
-      if (source.isDependency) progress.isDependency = true;
+      const progress = run.progress.sources[index];
       if (progress.state === 'completed') continue;
       if (source.skipOnRecovery) {
         progress.state = progress.rows > 0 ? 'partial' : 'failed';
@@ -337,7 +395,7 @@ async function executeRun(store, runId, secrets, {
         continue;
       }
       try {
-        await executeSource(store, run, index, secrets, context, update);
+        await executeSource(store, run, index, secrets, plans[index], context, update);
       } catch (error) {
         signal?.throwIfAborted();
         progress.state = progress.rows ? 'partial' : 'failed';

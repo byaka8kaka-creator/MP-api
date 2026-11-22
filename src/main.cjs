@@ -369,6 +369,7 @@ if (!app.requestSingleInstanceLock()) {
     });
     setupWindow();
     startWorker();
+    service.restoreFinishedTimes().catch(() => { workerIssue ??= 'Не удалось восстановить время завершения старых запусков.'; });
     scheduleTimer = setInterval(tick, 15_000);
     retentionTimer = setInterval(() => { if (workerReady && !quitting) worker.postMessage({ action: 'prune' }); }, 3_600_000);
   }).catch(() => {

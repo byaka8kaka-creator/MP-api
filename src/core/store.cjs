@@ -61,7 +61,7 @@ class Store {
       );
       CREATE TABLE IF NOT EXISTS runs (
         id TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id), owner TEXT REFERENCES users(id), state TEXT NOT NULL,
-        kind TEXT NOT NULL, name TEXT NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL,
+        kind TEXT NOT NULL, name TEXT NOT NULL, created INTEGER NOT NULL, updated INTEGER NOT NULL, finished_at INTEGER,
         snapshot TEXT NOT NULL, progress TEXT NOT NULL, pinned INTEGER NOT NULL DEFAULT 0
       );
       CREATE UNIQUE INDEX IF NOT EXISTS one_active_run ON runs (job_id)
@@ -83,6 +83,9 @@ class Store {
       }
       if (!this.db.prepare('PRAGMA table_info(templates)').all().some(column => column.name === 'archived_at')) {
         this.db.exec('ALTER TABLE templates ADD COLUMN archived_at INTEGER');
+      }
+      if (!this.db.prepare('PRAGMA table_info(runs)').all().some(column => column.name === 'finished_at')) {
+        this.db.exec('ALTER TABLE runs ADD COLUMN finished_at INTEGER');
       }
     });
     if (seed && !this.setting('initialized')) this.seed();
@@ -326,7 +329,7 @@ class Store {
   runs(owner = null) {
     const filter = owner ? 'WHERE owner = ?' : '';
     return this.db.prepare(`
-      SELECT id, job_id, owner, state, kind, name, created, updated, progress, pinned FROM runs
+      SELECT id, job_id, owner, state, kind, name, created, updated, finished_at, progress, pinned FROM runs
       ${filter} ORDER BY created DESC LIMIT 500
     `).all(...(owner ? [owner] : [])).map(row => decode(row, ['progress']));
   }
@@ -345,9 +348,20 @@ class Store {
     return id;
   }
 
-  updateRun(id, state, progress) {
-    this.db.prepare('UPDATE runs SET state = ?, progress = ?, updated = ? WHERE id = ?')
-      .run(state, stringify(progress), Date.now(), id);
+  updateRun(id, state, progress, now = Date.now()) {
+    this.db.prepare(`
+      UPDATE runs SET state = $state, progress = $progress, updated = $now,
+        finished_at = CASE WHEN $state IN ${ACTIVE} THEN NULL WHEN state <> $state THEN $now ELSE finished_at END
+      WHERE id = $id
+    `).run({ $id: id, $state: state, $progress: stringify(progress), $now: now });
+  }
+
+  runsWithoutFinish() {
+    return this.db.prepare(`SELECT id, state, created FROM runs WHERE finished_at IS NULL AND state NOT IN ${ACTIVE}`).all();
+  }
+
+  restoreRunFinish(id, state, time) {
+    this.db.prepare('UPDATE runs SET finished_at = ? WHERE id = ? AND state = ? AND finished_at IS NULL').run(time, id, state);
   }
 
   readyRun(id, snapshot) {

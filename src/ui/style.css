@@ -113,6 +113,9 @@ strong { font-weight: 650; }
 .nowrap { white-space: nowrap; }
 .table .title-cell strong { display: block; }
 .table .title-cell small { color: var(--muted); }
+.run-status { display: grid; justify-items: start; gap: 4px; }
+.run-status .caption { font-size: 12px; font-variant-numeric: tabular-nums; }
+.source-status > .cluster { width: 100%; justify-content: space-between; }
 .status { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 20px; background: #edf2ee; color: #3d5145; font-size: 12px; font-weight: 620; white-space: nowrap; }
 .status::before, .online::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .status.completed { color: #19593e; background: var(--primary-soft); }

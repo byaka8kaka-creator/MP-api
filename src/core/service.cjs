@@ -582,6 +582,23 @@ class Service {
     }
   }
 
+  async restoreFinishedTimes() {
+    const terminalEvents = { cancelled: 'cancelled', interrupted: 'interrupted', failed: 'schedule_failed' };
+    for (const run of this.store.runsWithoutFinish()) {
+      const log = await logTail(runLog(this.store, run.id)).catch(() => '');
+      const fallback = terminalEvents[run.state];
+      for (const line of log.trimEnd().split('\n').reverse()) {
+        let event;
+        try { event = JSON.parse(line); } catch { continue; }
+        if (!(event?.type === 'finished' && event.state === run.state) && !(fallback && event?.type === fallback)) continue;
+        const time = Date.parse(event.at);
+        if (!Number.isFinite(time) || time < run.created) continue;
+        this.store.restoreRunFinish(run.id, run.state, time);
+        break;
+      }
+    }
+  }
+
   async recover(dispatch) {
     for (const { id: runId, state } of this.store.activeRuns()) {
       if (state === 'queued') { dispatch(runId); continue; }

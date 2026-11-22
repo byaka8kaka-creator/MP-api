@@ -193,7 +193,11 @@ test('тест черновика сохраняет образец при не�
 });
 
 test('после прерывания безопасный запуск продолжает зафиксированную страницу и версию', async t => {
-  const fx = await fixture(t, () => ({ body: '{"orders":[],"next":0}' }));
+  let during;
+  const fx = await fixture(t, () => {
+    during = fx.store.run(id).progress.sources[0].requests;
+    return { body: '{"orders":[],"next":0}' };
+  });
   const job = fx.service.saveJob(fx.user, { name: 'Возобновление', format: 'csv', entries: [{ templateId: 'wb-orders' }] });
   const id = fx.service.createRun(fx.user, { kind: 'job', jobId: job });
   await writePage(fx.store, id, 0, 0, 0, [{ id: 1 }]);
@@ -205,12 +209,88 @@ test('после прерывания безопасный запуск прод
   const pending = [];
   await fx.service.recover(runId => pending.push(runId));
   assert.deepEqual(pending, [id]);
+  assert.equal(fx.store.run(id).finished_at, null);
   await fx.run(id);
   assert.equal(fx.requests.length, 1);
   assert.equal(fx.requests[0].url.searchParams.get('next'), '9223372036854775807');
   assert.equal(fx.requests[0].url.pathname, '/api/v3/orders');
   assert.equal(fx.store.run(id).state, 'completed');
   assert.equal(fx.store.pages(id, 0).length, 2);
+  assert.deepEqual(during, { done: 1, failed: 0, remaining: 1, exact: false });
+  assert.deepEqual(fx.store.run(id).progress.sources[0].requests, { done: 2, failed: 0, remaining: 0, exact: true });
+});
+
+test('прогресс показывает остаток в ожидании лимита и учитывает повтор как тот же запрос', async t => {
+  let runId;
+  const steps = [];
+  let triedSecond = false;
+  const fx = await fixture(t, request => {
+    const id = Number(request.url.searchParams.get('id'));
+    const current = fx.store.run(runId);
+    steps.push({ id, ...current.progress.sources[0].requests });
+    if (id === 2 && !triedSecond) {
+      triedSecond = true;
+      return { status: 429, body: '{}', headers: { 'Retry-After': '2' } };
+    }
+    if (id === 2) return { status: 400, body: '{}' };
+    return { body: JSON.stringify([{ id }]) };
+  });
+  const { service, store, user } = fx;
+  const templateId = service.saveDraft(user, stringify({ connectionId: 'wildberries', endpointId: 'marketplace',
+    name: 'Запросы по списку', method: 'GET', path: '/example', safeToRetry: true,
+    parameters: [{ name: 'id', where: 'query', type: 'array', items: { type: 'integer' }, batchSize: 1, encoding: 'csv' }],
+    limits: [{ id: 'example', type: 'bucket', refillMs: 200, burst: 1 }], response: { rows: '$' } }));
+  service.publish(user, templateId);
+  const processingId = service.saveProcessing(user, { templateId, name: 'Артикулы', columns: [{ path: 'id', name: 'ID' }] });
+  const jobId = service.saveJob(user, { name: 'Выгрузка', format: 'csv', entries: [{ templateId, processingId, values: '{"id":[1,2,3]}' }] });
+  runId = service.createRun(user, { kind: 'job', jobId });
+  let waiting;
+  await fx.run(runId, { wait: async () => { waiting = store.run(runId); } });
+  assert.deepEqual(steps.map(({ id, done, failed, remaining }) => [id, done, failed, remaining]),
+    [[1, 0, 0, 3], [2, 1, 0, 2], [2, 1, 0, 2], [3, 2, 1, 1]]);
+  assert.ok(steps.every(step => step.exact));
+  assert.equal(waiting.state, 'waiting');
+  assert.deepEqual(waiting.progress.sources[0].requests, { done: 1, failed: 0, remaining: 2, exact: true });
+  assert.equal(waiting.finished_at, null);
+  const run = store.run(runId);
+  assert.equal(run.state, 'partial');
+  assert.deepEqual(run.progress.sources[0].requests, { done: 3, failed: 1, remaining: 0, exact: true });
+  assert.ok(run.finished_at >= run.created);
+  const summary = service.runSummary(user, runId);
+  assert.equal(summary.finished_at, run.finished_at);
+  assert.equal(service.workspace(user).runs.find(item => item.id === runId).finished_at, run.finished_at);
+  const csv = await fs.readFile(path.join(run.progress.exportPath, '01-Артикулы.csv'), 'utf8');
+  assert.equal(csv, '\ufeffID\r\n1\r\n3\r\n');
+  store.updateRun(runId, run.state, { ...run.progress, exportPath: 'другой экспорт' }, run.finished_at + 1000);
+  assert.equal(store.run(runId).finished_at, run.finished_at);
+  assert.equal(store.run(runId).updated, run.finished_at + 1000);
+});
+
+test('время завершения старых запусков восстанавливается из журнала', async t => {
+  const { store, user } = await fixture(t);
+  const created = Date.now() - 10_000;
+  const start = () => store.createRun({ owner: user.id, name: 'История', kind: 'test', snapshot: { sources: [] }, now: created });
+  const recorded = start();
+  const missing = start();
+  const finished = created + 2000;
+  store.updateRun(recorded, 'completed', {}, finished);
+  store.updateRun(recorded, 'completed', {}, finished + 1500);
+  store.updateRun(missing, 'cancelled', {}, finished);
+  const filename = runLog(store, recorded);
+  await fs.mkdir(path.dirname(filename), { recursive: true });
+  await fs.writeFile(filename, `${JSON.stringify({ at: new Date(finished).toISOString(), type: 'finished', state: 'completed' })}\n`);
+
+  store.db.exec('ALTER TABLE runs DROP COLUMN finished_at');
+  const reopened = new Store(store.root);
+  try {
+    assert.equal(reopened.run(recorded).finished_at, null);
+    await new Service(reopened, null).restoreFinishedTimes();
+    assert.equal(reopened.run(recorded).finished_at, finished);
+    assert.equal(reopened.run(recorded).updated, finished + 1500);
+    assert.equal(reopened.run(missing).finished_at, null);
+  } finally {
+    reopened.close();
+  }
 });
 
 test('справочник обновляется явно, переносится описанием и защищён от циклов', async t => {
@@ -714,6 +794,7 @@ test('пустая цепочка пропускает HTTP-запросы, а �
   assert.match(empty.progress.sources[0].warning, /HTTP-запрос пропущен/);
   assert.deepEqual(requests.map(request => request.url.pathname), [countPath]);
   assert.ok(empty.progress.exportPath);
+  assert.deepEqual(empty.progress.sources[0].requests, { done: 0, failed: 0, remaining: 0, exact: true });
 
   mode = 'partial';
   requests.length = 0;

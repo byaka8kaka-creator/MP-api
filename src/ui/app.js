@@ -9,10 +9,12 @@ const states = {
 const roles = { admin: 'Администратор', configurator: 'Настройщик', user: 'Пользователь' };
 const week = [[1, 'Пн'], [2, 'Вт'], [3, 'Ср'], [4, 'Чт'], [5, 'Пт'], [6, 'Сб'], [0, 'Вс']];
 const datetime = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeStyle: 'short' });
+const runDatetime = new Intl.DateTimeFormat('ru-RU', { dateStyle: 'short', timeStyle: 'medium' });
 const number = new Intl.NumberFormat('ru-RU');
 const state = { user: null, workspace: null, page: 'jobs', connectionId: null, refreshKey: '', refreshing: false };
 let toastTimeout;
 let fieldCount = 0;
+let liveRunDetails;
 
 function h(tag, attributes = {}, ...children) {
   const node = document.createElement(tag);
@@ -100,6 +102,16 @@ function editedJson(raw, label) {
 
 function time(value) { return value ? datetime.format(value) : '—'; }
 
+function runTime(value) { return value == null ? '—' : runDatetime.format(value); }
+
+function runDuration(run) {
+  if (run.finished_at == null) return '';
+  const seconds = Math.floor(Math.max(0, run.finished_at - run.created) / 1000);
+  const parts = [[Math.floor(seconds / 86400), 'д'], [Math.floor(seconds / 3600) % 24, 'ч'],
+    [Math.floor(seconds / 60) % 60, 'мин'], [seconds % 60, 'с']];
+  return parts.filter(([value]) => value > 0).map(([value, unit]) => `${number.format(value)} ${unit}`).join(' ') || 'менее 1 с';
+}
+
 function brand() {
   return h('div', { class: 'brand' }, h('img', { src: 'icon.png', alt: '' }), h('span', {}, 'MP API'));
 }
@@ -122,7 +134,51 @@ function pill(key) {
   return h('span', { class: `status ${key}` }, states[key] ?? key);
 }
 
+function sourcePending(source) {
+  return !source.state || active.has(source.state) || source.state === 'interrupted';
+}
+
+function runRequests(run) {
+  const sources = Object.values(run.progress.sources ?? {});
+  if (!sources.some(source => source.requests)) return null;
+  const total = { done: 0, failed: 0, remaining: 0, skipped: 0, exact: true };
+  const running = active.has(run.state);
+  for (const source of sources) {
+    const counts = source.requests;
+    total.exact &&= counts?.exact === true;
+    if (!counts) continue;
+    total.done += counts.done;
+    total.failed += counts.failed;
+    const pending = running && sourcePending(source) ? 'remaining' : 'skipped';
+    total[pending] += counts.remaining;
+  }
+  return total;
+}
+
+function requestProgress(counts, running) {
+  if (!counts) return running ? 'Количество запросов рассчитывается…' : '';
+  const { done, remaining, exact, failed, skipped = 0 } = counts;
+  const completed = exact ? `Запросы ${number.format(done)} из ${number.format(done + remaining + skipped)}`
+    : `Выполнено запросов ${number.format(done)}`;
+  const estimate = value => `${exact ? '' : 'не менее '}${number.format(value)}`;
+  const omitted = skipped + (running ? 0 : remaining);
+  const pending = running && (exact || remaining ? `осталось ${estimate(remaining)}` : 'число оставшихся уточняется');
+  return [completed, pending, omitted && `не выполнено ${estimate(omitted)}`, failed && `с ошибкой ${number.format(failed)}`]
+    .filter(Boolean).join(' · ');
+}
+
+function runStatus(run) {
+  const running = active.has(run.state);
+  const progress = requestProgress(runRequests(run), running);
+  return h('div', { class: 'run-status' }, pill(run.state),
+    progress && h('div', { class: 'caption' }, progress),
+    running && run.progress.waiting && h('div', { class: 'caption' }, `Пауза до ${runTime(run.progress.waiting.until)}`),
+    running && run.progress.exporting && h('div', { class: 'caption' }, 'Обработка и запись файлов'),
+    run.progress.exportError && h('div', { class: 'caption' }, 'Ошибка экспорта'));
+}
+
 function modal(title, body, footer) {
+  liveRunDetails = null;
   editor.replaceChildren(
     h('div', { class: 'dialog-head' }, h('h2', { id: 'dialog-title' }, title), btn('Закрыть', () => editor.close(), 'ghost compact')),
     h('div', { class: 'dialog-body' }, body),
@@ -131,7 +187,10 @@ function modal(title, body, footer) {
   if (!editor.open) editor.showModal();
 }
 
-editor.addEventListener('close', () => editor.replaceChildren());
+editor.addEventListener('close', () => {
+  liveRunDetails = null;
+  editor.replaceChildren();
+});
 
 function formModal(title, content, label, submit) {
   const error = h('div', { class: 'notice error', role: 'alert', hidden: true });
@@ -162,6 +221,10 @@ async function refresh(force = false) {
       state.user = workspace.user;
       if (state.user.role === 'user' && ['api', 'templates'].includes(state.page)) state.page = 'jobs';
       render();
+      if (liveRunDetails && editor.open) {
+        const run = workspace.runs.find(item => item.id === liveRunDetails.id);
+        if (run) liveRunDetails.update(run);
+      }
     }
   } finally {
     state.refreshing = false;
@@ -283,7 +346,7 @@ function jobPage(workspace) {
       h('td', { class: 'title-cell' }, h('strong', {}, job.value.name),
         h('small', {}, `${job.value.format.toUpperCase()} · Источников ${job.value.entries.length}`)),
       h('td', {}, scheduleLabel(job.value.schedule), job.pending_at && h('div', { class: 'caption' }, `Проверка ${time(job.pending_at)}`)),
-      h('td', {}, last ? pill(last.state) : h('span', { class: 'caption' }, 'Ожидает запуска')),
+      h('td', {}, last ? runStatus(last) : h('span', { class: 'caption' }, 'Ожидает запуска')),
       h('td', {}, cluster(
         btn('Запустить', () => start({ kind: 'job', jobId: job.id }), 'primary compact', job.active || workspace.quitting),
         btn('Изменить', () => jobEditor(job.value), 'compact'),
@@ -320,14 +383,12 @@ function deleteJobDialog(job) {
 }
 
 function runsTable(runs) {
-  return table(['Запуск', 'Состояние', 'Получено строк', 'Действия'], runs.map(run => {
+  return table(['Запуск', 'Состояние', 'Завершение', 'Получено строк', 'Действия'], runs.map(run => {
     const rows = Object.values(run.progress.sources ?? {}).reduce((sum, source) => sum + (source.isDependency ? 0 : source.rows), 0);
     const kind = { job: 'Выгрузка', test: 'Проверка черновика', dictionary: 'Справочник' }[run.kind];
-    return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, run.name), h('small', {}, `${kind} · ${time(run.created)}`)),
-      h('td', {}, pill(run.state),
-        run.progress.waiting && h('div', { class: 'caption' }, `До ${time(run.progress.waiting.until)}`),
-        run.progress.exporting && h('div', { class: 'caption' }, 'Запись файла'),
-        run.progress.exportError && h('div', { class: 'caption' }, 'Ошибка экспорта')),
+    return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, run.name), h('small', {}, `${kind} · ${runTime(run.created)}`)),
+      h('td', {}, runStatus(run)),
+      h('td', { class: 'nowrap' }, runTime(run.finished_at), run.finished_at != null && h('div', { class: 'caption' }, runDuration(run))),
       h('td', {}, number.format(rows)),
       h('td', {}, cluster(btn('Подробнее', () => runDetails(run.id), 'compact'),
         active.has(run.state) && btn('Отменить', async () => {
@@ -981,25 +1042,25 @@ async function showVersions(templateId) {
     h('summary', {}, `Версия ${version.version} · ${time(version.published)}`), h('pre', { class: 'pre mono' }, version.json))));
 }
 
-async function runDetails(runId) {
+async function runDetails(runId, expectedView) {
   const run = await call('runInfo', { runId });
+  if (expectedView && (liveRunDetails !== expectedView || !editor.open)) return;
   const logs = btn('Открыть журнал', () => showLogs({ runId }));
+  const overview = stack();
+  const sourceHeaders = run.sources.map(() => h('div'));
   const results = run.sources.map((source, index) => {
     const progress = run.progress.sources?.[index] ?? {};
     const available = state.workspace.processings.filter(item => item.templateId === source.templateId);
     const ready = !active.has(run.state) && (progress.rows > 0 || progress.state === 'completed');
     const saved = Object.entries(run.progress.processingExports ?? {}).filter(([key]) => key.startsWith(`${index}:`));
-    return h('div', { class: 'source-card' }, cluster(h('h3', {}, source.name), progress.state && pill(progress.state)),
-      source.isDependency && h('small', { class: 'caption' }, 'Зависимый запрос'),
-      h('p', { class: 'caption' }, `${source.version ? `Версия ${source.version}` : 'Черновик'} · ${source.environment === 'sandbox' ? 'Песочница' : 'Рабочая среда'} · Строк ${number.format(progress.rows ?? 0)}`),
+    return h('div', { class: 'source-card' }, sourceHeaders[index],
       source.processingName && h('small', { class: 'caption' }, `Обработка · ${source.processingName}`),
-      progress.error && h('p', { class: 'notice error' }, progress.error),
-      progress.warning && h('p', { class: 'notice' }, progress.warning),
       source.values && h('details', { class: 'fold' }, h('summary', {}, 'Параметры запуска'), h('pre', { class: 'pre mono' }, source.values)),
       cluster(progress.rows > 0 && btn('Просмотр строк', () => showPreview(runId, index, 0), 'compact'),
         ready && available.length > 0 &&
           btn('Применить обработку', () => processSavedRun(runId, index, available), 'compact')),
-      saved.map(([key, output]) => cluster(h('small', { class: 'caption' }, `${output.name} · ${output.format.toUpperCase()}`),
+      saved.map(([key, output]) => cluster(h('small', { class: 'caption' },
+        [output.name, output.format.toUpperCase(), output.finishedAt && `Готово ${runTime(output.finishedAt)}`].filter(Boolean).join(' · ')),
         btn('Открыть обработанные файлы', () => call('openOutput', {
           runId, source: index, processingId: key.split(':')[1],
         }), 'compact'))));
@@ -1014,8 +1075,29 @@ async function runDetails(runId) {
     await runDetails(runId);
     showToast('Файлы экспорта готовы.');
   }
+  function paintProgress(summary) {
+    overview.replaceChildren(runStatus(summary), cluster(
+      h('small', { class: 'caption' }, `Запуск ${runTime(summary.created)}`),
+      summary.finished_at != null && h('small', { class: 'caption' }, `Завершение ${runTime(summary.finished_at)}`),
+      summary.finished_at != null && h('small', { class: 'caption' }, `Длительность ${runDuration(summary)}`),
+    ));
+    run.sources.forEach((source, index) => {
+      const progress = summary.progress.sources?.[index] ?? {};
+      const requests = requestProgress(progress.requests, active.has(summary.state) && sourcePending(progress));
+      const version = source.version ? `Версия ${source.version}` : 'Черновик';
+      const environment = source.environment === 'sandbox' ? 'Песочница' : 'Рабочая среда';
+      sourceHeaders[index].replaceChildren(h('div', { class: 'run-status source-status' },
+        cluster(h('h3', {}, source.name), progress.state && pill(progress.state)),
+        source.isDependency && h('small', { class: 'caption' }, 'Зависимый запрос'),
+        h('p', { class: 'caption' }, `${version} · ${environment} · Строк ${number.format(progress.rows ?? 0)}`),
+        requests && h('div', { class: 'caption' }, requests),
+        progress.error && h('p', { class: 'notice error' }, progress.error),
+        progress.warning && h('p', { class: 'notice' }, progress.warning)));
+    });
+  }
+  paintProgress(run);
   modal(run.name, [
-    cluster(pill(run.state), h('small', { class: 'caption' }, time(run.created))),
+    overview,
     run.progress.error && h('p', { class: 'notice error' }, run.progress.error),
     run.progress.exportError && h('p', { class: 'notice error' }, run.progress.exportError),
     results,
@@ -1029,6 +1111,17 @@ async function runDetails(runId) {
     hasResults && !active.has(run.state) && btn('CSV', () => exportFile('csv')),
     run.progress.exportPath && btn('Открыть папку файлов', () => call('openOutput', { runId }), 'primary'),
   ]);
+  if (active.has(run.state)) {
+    const view = { id: runId, loading: false, update(summary) {
+      paintProgress(summary);
+      if (active.has(summary.state) || view.loading) return;
+      view.loading = true;
+      runDetails(runId, view).catch(error => {
+        if (liveRunDetails === view) showToast(error.message, true);
+      }).finally(() => { view.loading = false; });
+    } };
+    liveRunDetails = view;
+  }
 }
 
 function processSavedRun(runId, source, choices) {

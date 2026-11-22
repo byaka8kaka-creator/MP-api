@@ -36,7 +36,7 @@ port.on('message', async ({ data }) => {
       if (processing) {
         latest.progress.processingExports ??= {};
         latest.progress.processingExports[`${sourceIndex}:${processing.id}`] = {
-          name: processing.name, path: output, format: data.format,
+          name: processing.name, path: output, format: data.format, finishedAt: Date.now(),
         };
       } else {
         latest.progress.exportPath = output;
