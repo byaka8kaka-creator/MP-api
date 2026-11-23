@@ -8,6 +8,7 @@ const ExcelJS = require('exceljs');
 const { InputError, get, inferShape, isLosslessNumber, parseJson, publicValue, scalarText, stringify } = require('./json.cjs');
 const { demand } = require('./model.cjs');
 const { processingRows, processingSteps, recordSample } = require('./processings.cjs');
+const { campaignColumns, campaignLookups, campaignRows, campaignSummaryRows, summaryHeaders } = require('./campaign-report.cjs');
 
 const XLSX_ROWS = 1_048_575;
 const DAY = 86_400_000;
@@ -179,8 +180,8 @@ function cellFrom(column, row, item, parent) {
   return cellValue(get(row, column.path));
 }
 
-async function* tabularRows(store, run, sourceIndex, columns, expansion, separate, processing) {
-  for await (const record of outputRecords(store, run, sourceIndex, processing)) {
+async function* tabularRows(readRows, columns, expansion, separate) {
+  for await (const record of readRows) {
     if (expansion === undefined) {
       yield columns.map(column => cellFrom(column, record, undefined, record));
       continue;
@@ -196,26 +197,39 @@ async function* tabularRows(store, run, sourceIndex, columns, expansion, separat
   }
 }
 
-function tables(store, run, override, sourceIndex) {
+function sourceTables(source, readRows, processing, extraColumns = []) {
+  if (processing) return [{
+    name: processing.name, headers: processing.columns.map(column => column.name),
+    rows: tabularRows(readRows(), processing.columns), rowCount: 0,
+  }];
+  const response = source.template.response;
+  const main = [...tableColumns(response.columns).filter(column => !extraColumns.some(extra => extra.name === column.name)),
+    ...extraColumns];
+  const definitions = [{
+    name: source.template.name, headers: main.map(column => column.name),
+    rows: tabularRows(readRows(), main, response.expand, false), rowCount: 0,
+  }];
+  for (const table of response.tables) {
+    const fields = tableColumns(table.columns);
+    definitions.push({ name: table.name, headers: fields.map(column => column.name),
+      rows: tabularRows(readRows(), fields, table.path, true), rowCount: 0 });
+  }
+  return definitions;
+}
+
+async function tables(store, run, override, sourceIndex) {
+  if (!override && run.snapshot.campaignReport) {
+    const { statistic, adverts, products } = run.snapshot.campaignReport;
+    const lookups = await campaignLookups(records(store, run, adverts), records(store, run, products));
+    const readStats = () => records(store, run, statistic);
+    const sheets = sourceTables(run.snapshot.sources[statistic], () => campaignRows(readStats(), lookups), undefined, campaignColumns);
+    sheets.push({ name: 'Свод РК', headers: summaryHeaders, rows: campaignSummaryRows(readStats(), lookups), rowCount: 0 });
+    return sheets;
+  }
   return run.snapshot.sources.flatMap((source, index) => {
     if (override ? index !== sourceIndex : source.isDependency) return [];
     const processing = override ?? source.processing;
-    if (processing) return [{
-      name: processing.name, headers: processing.columns.map(column => column.name),
-      rows: tabularRows(store, run, index, processing.columns, undefined, false, processing), rowCount: 0,
-    }];
-    const response = source.template.response;
-    const main = tableColumns(response.columns);
-    const definitions = [{
-      name: source.template.name, headers: main.map(column => column.name),
-      rows: tabularRows(store, run, index, main, response.expand, false), rowCount: 0,
-    }];
-    for (const table of response.tables) {
-      const fields = tableColumns(table.columns);
-      definitions.push({ name: table.name, headers: fields.map(column => column.name),
-        rows: tabularRows(store, run, index, fields, table.path, true), rowCount: 0 });
-    }
-    return definitions;
+    return sourceTables(source, () => outputRecords(store, run, index, processing), processing);
   });
 }
 
@@ -316,7 +330,7 @@ async function exportRun(store, run, format, { rowLimit = XLSX_ROWS, processing,
   demand(run.snapshot.sources.length && Object.values(sources).some(source =>
     source?.rows > 0 || source?.state === 'completed'), 'Доступных результатов для экспорта нет.');
   const title = processing?.name ?? run.name;
-  const definitions = tables(store, run, processing, sourceIndex);
+  const definitions = await tables(store, run, processing, sourceIndex);
   demand(definitions.length, 'Доступных таблиц для экспорта нет.');
   const target = path.join(store.root, 'exports');
   const temporary = await fs.mkdtemp(path.join(target, '.export-'));

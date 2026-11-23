@@ -630,6 +630,7 @@ function jobEditor(job) {
   const name = input(job?.name, { required: true, maxlength: 160 });
   const folder = input(job?.folder, { maxlength: 250, placeholder: 'Рабочие / Заказы' });
   const format = select([['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV']], job?.format ?? 'xlsx');
+  const campaignReport = checkbox('Свод РК по брендам', job?.campaignReport);
   const enabled = checkbox('Запуск по расписанию', Boolean(job?.schedule));
   const days = week.map(([day, label]) => [day, checkbox(label, job?.schedule?.days.includes(day) ?? false)]);
   const scheduledTime = input(job?.schedule?.time ?? '09:00', { type: 'time' });
@@ -673,10 +674,11 @@ function jobEditor(job) {
   for (const entry of job?.entries ?? [null]) add(entry);
   formModal(job ? 'Настройка выгрузки' : 'Новая выгрузка', [
     fields(field('Название', name), field('Папка', folder), field('Формат файлов', format)),
-    enabled.label, schedule, h('h3', {}, 'Источники'), sourceList,
+    campaignReport.label, enabled.label, schedule, h('h3', {}, 'Источники'), sourceList,
     cluster(btn('Добавить источник', () => add(), 'compact')),
   ], 'Сохранить', async () => {
     await call('job', { id: job?.id, name: name.value, folder: folder.value, format: format.value,
+      campaignReport: campaignReport.control.checked,
       entries: sources.map(item => item.value()),
       schedule: enabled.control.checked ? { days: days.filter(([, item]) => item.control.checked).map(([day]) => day), time: scheduledTime.value } : null,
     });

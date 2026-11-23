@@ -770,6 +770,94 @@ test('fullstats отбирает статусы до разворота камп
   assert.match(store.run(emptyId).progress.sources[0].warning, /HTTP-запрос пропущен/);
 });
 
+test('«Свод РК» объединяет три запроса и суммирует кампании по брендам и частям периода', async t => {
+  const oldArticle = '9223372036854775807';
+  const ids = [1, 2, 3, 4, 5];
+  const metrics = multiplier => ({ views: multiplier * 10, clicks: multiplier * 2, atbs: multiplier * 3,
+    orders: multiplier * 2, canceled: multiplier, sum: multiplier * 1.25, sum_price: multiplier * 10.5 });
+  const fx = await fixture(t, request => {
+    if (request.url.pathname === '/adv/v1/promotion/count') {
+      return { body: JSON.stringify({ adverts: [{ status: 9, advert_list: ids.map(advertId => ({ advertId })) }] }) };
+    }
+    if (request.url.pathname === '/api/advert/v3/adverts') {
+      return { body: JSON.stringify({ adverts: [
+        { advertId: '1', nms: [{ nmId: oldArticle }, { nmId: 11 }, { nmId: 11 }] },
+        { advertId: 2, nms: [{ nmId: 11 }] },
+        { advertId: 3, nms: [{ nmId: 11 }, { nmId: 20 }] },
+        { advertId: 4, nms: [{ nmId: 30 }] },
+        { advertId: 5, nms: [{ nmId: 11 }, { nmId: 20 }] },
+      ] }) };
+    }
+    if (request.url.pathname === FUNNEL_PATH) {
+      return { body: `{"data":{"products":[{"product":{"nmId":${oldArticle},"brandName":"Альфа"}},` +
+        '{"product":{"nmId":11,"brandName":"Альфа"}},{"product":{"nmId":20,"brandName":"Бета"}}]}}' };
+    }
+    const date = request.url.searchParams.get('beginDate');
+    return { body: JSON.stringify(ids.map(advertId => ({
+      advertId, currency: 'RUB', ...metrics(advertId === 3 ? 5 : advertId),
+      days: [{ date, views: advertId * 10, apps: advertId === 3 ? [
+        { appType: 64, nms: [{ nmId: 11, ...metrics(2) }, { nmId: 20, ...metrics(3) }] },
+      ] : [] }],
+    }))) };
+  });
+  const { store, service, user, requests } = fx;
+  const [listId, advertsId] = installAdvertising(fx);
+  const { connectionId, endpointId } = store.template(advertsId).published;
+  const statsId = service.saveDraft(user, stringify({ connectionId, endpointId, name: 'Статистика кампаний WB',
+    method: 'GET', path: '/adv/v3/fullstats', parameters: [
+      { name: 'ids', where: 'query', type: 'array', items: { type: 'integer' }, batchSize: 50, encoding: 'csv',
+        reference: { templateId: listId, mode: 'all', refresh: 'run', expand: 'advert_list', path: 'advertId' } },
+      { name: 'from', key: 'beginDate', where: 'query', type: 'date', required: true },
+      { name: 'to', key: 'endDate', where: 'query', type: 'date', required: true },
+    ], period: { from: 'from', to: 'to', daysPerRequest: 31 }, response: { rows: '$', deduplicateBy: 'advertId',
+      columns: [{ path: 'advertId', name: 'ID кампании' }, { path: 'request.beginDate', name: 'Начало периода' }],
+      tables: [{ name: 'Кампании по дням', path: 'days', columns: [
+        { path: '$parent.advertId', name: 'ID кампании' }, { path: 'date', name: 'Дата' },
+      ] }, { name: 'Средняя позиция', path: 'boosterStats' }],
+    } }));
+  const productsId = service.saveDraft(user, stringify({ connectionId: 'wildberries', endpointId: 'marketplace', name: 'Воронка',
+    method: 'POST', path: FUNNEL_PATH, parameters: [{ name: 'selectedPeriod', where: 'body', type: 'object', properties: {
+      start: { type: 'date', required: true }, end: { type: 'date', required: true },
+    } }], response: { rows: 'data.products' } }));
+  service.publish(user, statsId);
+  service.publish(user, productsId);
+  const job = { name: 'Реклама по брендам', format: 'xlsx', campaignReport: true, entries: [
+    { templateId: productsId, values: '{"selectedPeriod":{"start":"2026-11-19","end":"2026-11-20"}}' },
+    { templateId: statsId, values: '{"from":"2026-10-01","to":"2026-11-01"}' },
+    { templateId: advertsId },
+  ] };
+  assert.throws(() => service.saveJob(user, { ...job, entries: job.entries.slice(1) }), /три шаблона/);
+  assert.throws(() => service.saveJob(user, { ...job, entries: [{ templateId: productsId }, ...job.entries.slice(1)] }), /selectedPeriod/);
+  const jobId = service.saveJob(user, job);
+  const runId = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(runId);
+  const run = store.run(runId);
+  assert.equal(run.state, 'completed');
+  assert.equal(run.progress.exportError, undefined);
+  assert.equal(requests.filter(request => request.url.pathname === '/adv/v1/promotion/count').length, 1);
+  assert.deepEqual(JSON.parse(requests.find(request => request.url.pathname === FUNNEL_PATH).body),
+    { selectedPeriod: { start: '2026-11-19', end: '2026-11-20' } });
+  assert.deepEqual(requests.filter(request => request.url.pathname === '/adv/v3/fullstats')
+    .map(request => [request.url.searchParams.get('beginDate'), request.url.searchParams.get('endDate')]),
+  [['2026-10-01', '2026-10-31'], ['2026-11-01', '2026-11-01']]);
+  const files = await fs.readdir(run.progress.exportPath);
+  const book = new ExcelJS.Workbook();
+  await book.xlsx.readFile(path.join(run.progress.exportPath, files.find(filename => filename.endsWith('.xlsx'))));
+  assert.deepEqual(book.worksheets.map(sheet => sheet.name), ['Статистика кампаний WB', 'Кампании по дням', 'Средняя позиция', 'Свод РК']);
+  const main = book.worksheets[0];
+  assert.deepEqual(main.getRow(1).values.slice(1), ['ID кампании', 'Начало периода', 'Артикул WB', 'Бренд']);
+  assert.deepEqual(main.getRow(2).values.slice(1), [1, '2026-10-01', `${oldArticle}, 11`, 'Альфа']);
+  assert.equal(main.rowCount, 11);
+  assert.equal(book.getWorksheet('Кампании по дням').rowCount, 11);
+  const summary = book.getWorksheet('Свод РК').getSheetValues().slice(2).map(row => row.slice(1));
+  assert.deepEqual(summary, [['2026-10-01', '2026-10-31'], ['2026-11-01', '2026-11-01']].flatMap(([begin, end]) => [
+    ['Альфа', begin, end, ...Object.values(metrics(5))],
+    ['Бета', begin, end, ...Object.values(metrics(3))],
+    ['Бренд не определён', begin, end, ...Object.values(metrics(4))],
+    ['Несколько брендов', begin, end, ...Object.values(metrics(5))],
+  ]));
+});
+
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
   let mode = 'empty';
   const countPath = '/adv/v1/promotion/count';

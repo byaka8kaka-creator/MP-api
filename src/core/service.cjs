@@ -6,6 +6,7 @@ const { demand, folder, id, inputValues, profileFor, text, validateConnection, v
 const { generalLog, logEvent, logTail, preview, referenceValues, runLog, sample } = require('./datasets.cjs');
 const { processingDefaults, processingSteps, validateProcessing } = require('./processings.cjs');
 const { scheduleDecision, validateSchedule } = require('./schedule.cjs');
+const { planCampaignReport } = require('./campaign-report.cjs');
 
 function canConfigure(user) {
   return user.role === 'admin' || user.role === 'configurator';
@@ -442,11 +443,15 @@ class Service {
       if (item.processingId) entry.processingId = id(item.processingId);
       return entry;
     });
-    this.planSources(owner, entries, false, new Date());
+    const { sources } = this.planSources(owner, entries, false, new Date());
     demand(['xlsx', 'csv'].includes(value.format), 'Выберите XLSX или CSV.');
     const schedule = validateSchedule(value.schedule);
     const job = { id: jobId, name: text(value.name, 'название выгрузки'), folder: folder(value.folder),
       entries, format: value.format, schedule };
+    if (value.campaignReport === true) {
+      planCampaignReport(sources);
+      job.campaignReport = true;
+    }
     const unchanged = JSON.stringify(existing?.value.schedule ?? null) === JSON.stringify(schedule);
     demand(this.store.putJob(job, owner.id, unchanged).changes === 1, 'Выгрузка недоступна.');
     return jobId;
@@ -466,6 +471,7 @@ class Service {
       const actor = this.store.user(job.owner);
       const snapshot = { format: job.value.format, ...this.planSources(actor, job.value.entries, false, runDay),
         scheduledFor: value.scheduledFor ?? null };
+      if (job.value.campaignReport) snapshot.campaignReport = planCampaignReport(snapshot.sources);
       return this.store.createRun({ owner: job.owner, jobId: job.id, name: job.value.name, kind: 'job', snapshot, now });
     }
     demand(canConfigure(user) && ['test', 'dictionary'].includes(value.kind), 'Запуск доступен настройщику.');
