@@ -6,7 +6,8 @@ const { demand, folder, id, inputValues, profileFor, text, validateConnection, v
 const { generalLog, logEvent, logTail, preview, referenceValues, runLog, sample } = require('./datasets.cjs');
 const { processingDefaults, processingSteps, validateProcessing } = require('./processings.cjs');
 const { scheduleDecision, validateSchedule } = require('./schedule.cjs');
-const { planCampaignReport } = require('./campaign-report.cjs');
+const { campaignRecipe, planCampaignReport } = require('./campaign-report.cjs');
+const { validateWorkbook, workbookBindings } = require('./workbook-processing.cjs');
 
 function canConfigure(user) {
   return user.role === 'admin' || user.role === 'configurator';
@@ -17,6 +18,27 @@ function safeToSee(user, owner) {
 }
 
 const activeStates = new Set(['queued', 'running', 'waiting']);
+
+function processingTemplates(processing) {
+  return processing.scope === 'workbook' ? processing.sources.map(source => source.templateId) : [processing.templateId];
+}
+
+function savedSources(run, bindings) {
+  return bindings.some(index => {
+    const progress = run.progress.sources?.[index];
+    return progress?.rows > 0 || progress?.state === 'completed';
+  });
+}
+
+function savedWorkbookSources(run, processing) {
+  try {
+    const bindings = Object.values(workbookBindings(processing, run.snapshot.sources));
+    return savedSources(run, bindings) ? bindings : null;
+  } catch (error) {
+    if (!(error instanceof InputError)) throw error;
+    return null;
+  }
+}
 
 function formTemplate(template, version) {
   return {
@@ -70,6 +92,28 @@ class Service {
   constructor(store, vault) {
     this.store = store;
     this.vault = vault;
+    this.migrateCampaignReports();
+  }
+
+  migrateCampaignReports() {
+    const jobs = this.store.jobs().filter(job => job.value.campaignReport && !job.value.workbookProcessingId);
+    if (!jobs.length) return;
+    this.store.transaction(() => {
+      for (const job of jobs) {
+        const recipe = campaignRecipe(job.value.entries.map(entry => this.store.template(entry.templateId)?.published));
+        if (!recipe) continue;
+        let config;
+        try { config = validateWorkbook({ ...recipe, id: randomUUID() }); }
+        catch (error) {
+          if (!(error instanceof InputError)) throw error;
+          continue;
+        }
+        this.store.putProcessing(config);
+        job.value.workbookProcessingId = config.id;
+        delete job.value.campaignReport;
+        this.store.putJob(job.value, job.owner, true);
+      }
+    });
   }
 
   workspace(user) {
@@ -91,10 +135,15 @@ class Service {
         if (record.draft.connectionId === option.connectionId) option.folder = record.draft.folder;
         const connection = connections.find(item => item.id === option.connectionId);
         const endpoint = connection?.endpoints.find(item => item.id === record.published.endpointId);
+        const { columns, expand, tables } = record.published.response;
         return { ...option, connection: connection?.name, sandbox: Boolean(endpoint?.sandbox), archived: Boolean(record.archived_at),
-          processingDefaults: editor ? processingDefaults(record.published) : undefined };
+          processingDefaults: editor ? processingDefaults(record.published) : undefined,
+          sheetDefaults: editor ? { columns, expand, tables } : undefined };
       }),
-      processings: store.processings().filter(item => visibleIds.has(item.templateId)).map(item => {
+      campaignPreset: editor ? stringify(campaignRecipe(visible.filter(item => !item.archived_at).map(item => item.published))) : undefined,
+      processings: store.processings().filter(item => processingTemplates(item).every(templateId => visibleIds.has(templateId))).map(item => {
+        if (item.scope === 'workbook') return { ...publicValue(item),
+          recipeJson: stringify({ sources: item.sources, steps: item.steps, sheets: item.sheets }, null, 2) };
         const steps = processingSteps(item);
         return { ...item, steps: publicValue(steps), recipeJson: stringify({ steps, columns: item.columns }, null, 2) };
       }),
@@ -124,6 +173,19 @@ class Service {
     demand(object(value), 'Укажите настройки обработки.');
     const processingId = value.id ? id(value.id) : randomUUID();
     const previous = this.store.processing(processingId);
+    const scope = value.scope ?? 'source';
+    demand(['source', 'workbook'].includes(scope), 'Выберите область обработки.');
+    demand(!previous || (previous.scope ?? 'source') === scope, 'Для другой области создайте отдельную обработку.');
+    if (scope === 'workbook') {
+      const processing = validateWorkbook({ ...value, id: processingId });
+      const previousIds = new Set(previous ? processingTemplates(previous) : []);
+      for (const templateId of processingTemplates(processing)) {
+        const record = this.store.template(templateId);
+        demand(record?.published && (!record.archived_at || previousIds.has(templateId)), 'Выберите опубликованный шаблон для каждого источника.');
+      }
+      this.store.putProcessing(processing);
+      return processingId;
+    }
     const templateId = id(value.templateId);
     demand(!previous || previous.templateId === templateId, 'Создайте отдельную обработку для другого шаблона.');
     const record = this.store.template(templateId);
@@ -135,21 +197,36 @@ class Service {
 
   processingFor(user, processingId, template) {
     const config = this.store.processing(id(processingId));
-    demand(config, 'Обработка отсутствует.');
+    demand(config && config.scope !== 'workbook', 'Обработка источника отсутствует.');
     demand(canConfigure(user) || this.store.template(config.templateId)?.published?.available, 'Обработка недоступна.');
     return validateProcessing(config, template);
+  }
+
+  workbookFor(user, processingId) {
+    const config = this.store.processing(id(processingId));
+    demand(config?.scope === 'workbook', 'Выберите обработку всей выгрузки.');
+    demand(canConfigure(user) || processingTemplates(config).every(templateId => this.store.template(templateId)?.published?.available),
+      'Обработка выгрузки недоступна.');
+    return validateWorkbook(config);
   }
 
   deleteProcessing(user, processingId) {
     demand(canConfigure(user), 'Обработки редактирует настройщик.');
     const config = this.store.processing(id(processingId));
     demand(config, 'Обработка отсутствует.');
-    const jobs = this.store.jobs().filter(job => job.value.entries.some(entry => entry.processingId === processingId));
+    const jobs = this.store.jobs().filter(job => job.value.workbookProcessingId === processingId ||
+      job.value.entries.some(entry => entry.processingId === processingId));
     demand(!jobs.length, `Уберите обработку из выгрузок перед удалением. ${jobs.map(job => job.value.name).join(', ')}`);
     this.store.removeProcessing(processingId);
   }
 
   processingFromRun(user, run, value) {
+    if (value.workbook === true) {
+      const processing = this.workbookFor(user, value.processingId);
+      const bindings = workbookBindings(processing, run.snapshot.sources);
+      demand(savedSources(run, Object.values(bindings)), 'В запуске нет сохранённых строк для обработки.');
+      return { processing };
+    }
     const index = value.source;
     demand(Number.isInteger(index) && run.snapshot.sources[index], 'Выберите источник данных.');
     const progress = run.progress.sources?.[index];
@@ -157,13 +234,20 @@ class Service {
     return { sourceIndex: index, processing: this.processingFor(user, value.processingId, run.snapshot.sources[index].template) };
   }
 
-  processingRuns(user, templateId) {
+  processingRuns(user, templateId, workbookSources) {
     demand(canConfigure(user), 'Настройка обработки доступна настройщику.');
-    id(templateId);
+    if (workbookSources !== undefined) {
+      if (!Array.isArray(workbookSources) || !workbookSources.length) return [];
+    } else id(templateId);
     return this.store.runs(user.role === 'admin' ? null : user.id).flatMap(summary => {
       if (activeStates.has(summary.state)) return [];
       const run = this.store.run(summary.id);
       if (!run) return [];
+      if (workbookSources) {
+        const bindings = savedWorkbookSources(run, { sources: workbookSources });
+        return bindings ? [{ runId: run.id, name: summary.name, created: summary.created,
+          rows: [...new Set(bindings)].reduce((sum, index) => sum + (run.progress.sources?.[index]?.rows ?? 0), 0) }] : [];
+      }
       return run.snapshot.sources.flatMap((source, index) => {
         const progress = run.progress.sources?.[index];
         return source.template.id === templateId && (progress?.rows > 0 || progress?.state === 'completed')
@@ -177,6 +261,12 @@ class Service {
     demand(canConfigure(user), 'Настройка обработки доступна настройщику.');
     const run = this.getRun(user, value.runId);
     demand(!activeStates.has(run.state), 'Дождитесь завершения запуска.');
+    if (value.scope === 'workbook') {
+      const processing = validateWorkbook({ ...value, id: value.id ?? randomUUID() });
+      const bindings = workbookBindings(processing, run.snapshot.sources);
+      demand(savedSources(run, Object.values(bindings)), 'В запуске нет сохранённых строк для предпросмотра.');
+      return { runId: run.id, processing };
+    }
     const index = value.source;
     demand(Number.isInteger(index) && run.snapshot.sources[index], 'Выберите сохранённый источник.');
     const progress = run.progress.sources?.[index];
@@ -272,8 +362,8 @@ class Service {
       jobs: this.store.jobs().filter(job => job.value.entries.some(entry => published.has(entry.templateId)))
         .map(job => ({ name: job.value.name, folder: job.value.folder,
           indirect: !job.value.entries.some(entry => entry.templateId === templateId) })),
-      processings: this.store.processings().filter(processing => published.has(processing.templateId))
-        .map(processing => ({ name: processing.name, indirect: processing.templateId !== templateId })),
+      processings: this.store.processings().filter(processing => processingTemplates(processing).some(id => published.has(id)))
+        .map(processing => ({ name: processing.name, indirect: !processingTemplates(processing).includes(templateId) })),
       templates: records.filter(record => record.id !== templateId && affected.has(record.id))
         .map(record => ({ name: record.draft.name, folder: record.draft.folder,
           connection: this.store.connection(record.draft.connectionId)?.name,
@@ -448,12 +538,23 @@ class Service {
     const schedule = validateSchedule(value.schedule);
     const job = { id: jobId, name: text(value.name, 'название выгрузки'), folder: folder(value.folder),
       entries, format: value.format, schedule };
-    if (value.campaignReport === true) {
+    let createdProcessing;
+    if (value.workbookProcessingId) {
+      const processing = this.workbookFor(owner, value.workbookProcessingId);
+      workbookBindings(processing, sources);
+      job.workbookProcessingId = processing.id;
+    } else if (value.campaignReport === true) {
       planCampaignReport(sources);
-      job.campaignReport = true;
+      const recipe = campaignRecipe(sources.filter(source => !source.isDependency).map(source => source.template));
+      demand(recipe, 'Выберите подходящие шаблоны для «Свода РК».');
+      createdProcessing = validateWorkbook({ ...recipe, id: randomUUID() });
+      job.workbookProcessingId = createdProcessing.id;
     }
     const unchanged = JSON.stringify(existing?.value.schedule ?? null) === JSON.stringify(schedule);
-    demand(this.store.putJob(job, owner.id, unchanged).changes === 1, 'Выгрузка недоступна.');
+    this.store.transaction(() => {
+      if (createdProcessing) this.store.putProcessing(createdProcessing);
+      demand(this.store.putJob(job, owner.id, unchanged).changes === 1, 'Выгрузка недоступна.');
+    });
     return jobId;
   }
 
@@ -471,7 +572,10 @@ class Service {
       const actor = this.store.user(job.owner);
       const snapshot = { format: job.value.format, ...this.planSources(actor, job.value.entries, false, runDay),
         scheduledFor: value.scheduledFor ?? null };
-      if (job.value.campaignReport) snapshot.campaignReport = planCampaignReport(snapshot.sources);
+      if (job.value.workbookProcessingId) {
+        const processing = this.workbookFor(actor, job.value.workbookProcessingId);
+        snapshot.workbook = { processing, bindings: workbookBindings(processing, snapshot.sources) };
+      } else if (job.value.campaignReport) snapshot.campaignReport = planCampaignReport(snapshot.sources);
       return this.store.createRun({ owner: job.owner, jobId: job.id, name: job.value.name, kind: 'job', snapshot, now });
     }
     demand(canConfigure(user) && ['test', 'dictionary'].includes(value.kind), 'Запуск доступен настройщику.');
@@ -498,8 +602,12 @@ class Service {
   runSummary(user, runId) {
     const run = this.getRun(user, runId);
     const { snapshot, ...summary } = run;
+    const workbookChoices = activeStates.has(run.state) ? [] : this.store.processings().filter(item => item.scope === 'workbook' &&
+      (canConfigure(user) || processingTemplates(item).every(templateId => this.store.template(templateId)?.published?.available)) &&
+      savedWorkbookSources(run, item)).map(item => item.id);
     return {
-      ...summary, sources: snapshot.sources.map(source => {
+      ...summary, workbookChoices, workbookProcessingName: snapshot.workbook?.processing.name ?? (snapshot.campaignReport ? 'Свод РК' : undefined),
+      sources: snapshot.sources.map(source => {
         const values = { ...(source.resolved ?? source.values) };
         for (const name of Object.keys(source.liveReferences ?? {})) {
           const list = values[name];

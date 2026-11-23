@@ -630,7 +630,13 @@ function jobEditor(job) {
   const name = input(job?.name, { required: true, maxlength: 160 });
   const folder = input(job?.folder, { maxlength: 250, placeholder: 'Рабочие / Заказы' });
   const format = select([['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV']], job?.format ?? 'xlsx');
-  const campaignReport = checkbox('Свод РК по брендам', job?.campaignReport);
+  const workbookChoices = processings.filter(item => item.scope === 'workbook');
+  const workbookModes = [['', 'Без общей обработки'], ...workbookChoices.map(item => [item.id, item.name])];
+  if (job?.campaignReport) workbookModes.push(['legacyCampaign', 'Сохранённый Свод РК']);
+  if (job?.workbookProcessingId && !workbookChoices.some(item => item.id === job.workbookProcessingId)) {
+    workbookModes.push([job.workbookProcessingId, 'Сохранённая обработка недоступна', true]);
+  }
+  const workbook = select(workbookModes, job?.workbookProcessingId ?? (job?.campaignReport ? 'legacyCampaign' : ''));
   const enabled = checkbox('Запуск по расписанию', Boolean(job?.schedule));
   const days = week.map(([day, label]) => [day, checkbox(label, job?.schedule?.days.includes(day) ?? false)]);
   const scheduledTime = input(job?.schedule?.time ?? '09:00', { type: 'time' });
@@ -674,11 +680,12 @@ function jobEditor(job) {
   for (const entry of job?.entries ?? [null]) add(entry);
   formModal(job ? 'Настройка выгрузки' : 'Новая выгрузка', [
     fields(field('Название', name), field('Папка', folder), field('Формат файлов', format)),
-    campaignReport.label, enabled.label, schedule, h('h3', {}, 'Источники'), sourceList,
+    field('Обработка всей выгрузки', workbook, 'Добавьте указанные в обработке источники. Она строит выбранные в ней листы из сохранённых ответов API.'),
+    enabled.label, schedule, h('h3', {}, 'Источники'), sourceList,
     cluster(btn('Добавить источник', () => add(), 'compact')),
   ], 'Сохранить', async () => {
     await call('job', { id: job?.id, name: name.value, folder: folder.value, format: format.value,
-      campaignReport: campaignReport.control.checked,
+      ...(workbook.value === 'legacyCampaign' ? { campaignReport: true } : { workbookProcessingId: workbook.value || undefined }),
       entries: sources.map(item => item.value()),
       schedule: enabled.control.checked ? { days: days.filter(([, item]) => item.control.checked).map(([day]) => day), time: scheduledTime.value } : null,
     });
@@ -694,11 +701,13 @@ function processingPage(workspace) {
       editor && btn('Новая обработка', () => processingEditor(), 'primary', !supported)),
     section('Сохранённые обработки', null,
       workspace.processings.length
-        ? table(['Обработка', 'Шаблон запроса', 'Шаги', 'Действия'], workspace.processings.map(processing => {
-          const template = workspace.options.find(option => option.id === processing.templateId);
+        ? table(['Обработка', 'Область обработки', 'Шаги', 'Действия'], workspace.processings.map(processing => {
+          const workbook = processing.scope === 'workbook';
+          const sources = workbook ? processing.sources : [processing];
+          const templateNames = sources.map(source => workspace.options.find(option => option.id === source.templateId)?.name).filter(Boolean);
           return h('tr', {}, h('td', { class: 'title-cell' }, h('strong', {}, processing.name)),
-          h('td', {}, template?.name),
-          h('td', {}, number.format(processing.steps.length + 1)),
+          h('td', {}, h('div', {}, workbook ? 'Вся выгрузка' : 'Один источник'), h('small', { class: 'caption' }, [...new Set(templateNames)].join(' · '))),
+          h('td', {}, number.format(processing.steps.length)),
           h('td', {}, cluster(editor && btn('Изменить', () => processingEditor(processing), 'compact'),
             editor && btn('Удалить', () => formModal('Удалить обработку', h('p', {}, processing.name), 'Удалить', async () => {
               await call('deleteProcessing', { processingId: processing.id });
@@ -1049,23 +1058,24 @@ async function runDetails(runId, expectedView) {
   if (expectedView && (liveRunDetails !== expectedView || !editor.open)) return;
   const logs = btn('Открыть журнал', () => showLogs({ runId }));
   const overview = stack();
+  const workbookChoices = state.workspace.processings.filter(item => run.workbookChoices.includes(item.id));
+  const savedOutputs = Object.entries(run.progress.processingExports ?? {});
+  const outputLink = ([key, output], source, workbook = false) => cluster(h('small', { class: 'caption' },
+    [output.name, output.format.toUpperCase(), output.finishedAt && `Готово ${runTime(output.finishedAt)}`].filter(Boolean).join(' · ')),
+    btn('Открыть обработанные файлы', () => call('openOutput', { runId, source, workbook, processingId: key.split(':')[1] }), 'compact'));
   const sourceHeaders = run.sources.map(() => h('div'));
   const results = run.sources.map((source, index) => {
     const progress = run.progress.sources?.[index] ?? {};
     const available = state.workspace.processings.filter(item => item.templateId === source.templateId);
     const ready = !active.has(run.state) && (progress.rows > 0 || progress.state === 'completed');
-    const saved = Object.entries(run.progress.processingExports ?? {}).filter(([key]) => key.startsWith(`${index}:`));
+    const saved = savedOutputs.filter(([key]) => key.startsWith(`${index}:`));
     return h('div', { class: 'source-card' }, sourceHeaders[index],
       source.processingName && h('small', { class: 'caption' }, `Обработка · ${source.processingName}`),
       source.values && h('details', { class: 'fold' }, h('summary', {}, 'Параметры запуска'), h('pre', { class: 'pre mono' }, source.values)),
       cluster(progress.rows > 0 && btn('Просмотр строк', () => showPreview(runId, index, 0), 'compact'),
         ready && available.length > 0 &&
           btn('Применить обработку', () => processSavedRun(runId, index, available), 'compact')),
-      saved.map(([key, output]) => cluster(h('small', { class: 'caption' },
-        [output.name, output.format.toUpperCase(), output.finishedAt && `Готово ${runTime(output.finishedAt)}`].filter(Boolean).join(' · ')),
-        btn('Открыть обработанные файлы', () => call('openOutput', {
-          runId, source: index, processingId: key.split(':')[1],
-        }), 'compact'))));
+      saved.map(output => outputLink(output, index)));
   });
   const hasResults = run.sources.some((source, index) => {
     const progress = run.progress.sources?.[index];
@@ -1102,6 +1112,8 @@ async function runDetails(runId, expectedView) {
     overview,
     run.progress.error && h('p', { class: 'notice error' }, run.progress.error),
     run.progress.exportError && h('p', { class: 'notice error' }, run.progress.exportError),
+    run.workbookProcessingName && h('p', { class: 'caption' }, `Обработка всей выгрузки · ${run.workbookProcessingName}`),
+    savedOutputs.filter(([key]) => key.startsWith('workbook:')).map(output => outputLink(output, undefined, true)),
     results,
   ], [
     logs,
@@ -1111,6 +1123,7 @@ async function runDetails(runId, expectedView) {
     }),
     hasResults && !active.has(run.state) && btn('XLSX', () => exportFile('xlsx')),
     hasResults && !active.has(run.state) && btn('CSV', () => exportFile('csv')),
+    workbookChoices.length > 0 && btn('Применить обработку выгрузки', () => processSavedRun(runId, undefined, workbookChoices, true)),
     run.progress.exportPath && btn('Открыть папку файлов', () => call('openOutput', { runId }), 'primary'),
   ]);
   if (active.has(run.state)) {
@@ -1126,12 +1139,12 @@ async function runDetails(runId, expectedView) {
   }
 }
 
-function processSavedRun(runId, source, choices) {
+function processSavedRun(runId, source, choices, workbook = false) {
   const processing = select(choices.map(item => [item.id, item.name]));
   const format = select([['xlsx', 'Excel (.xlsx)'], ['csv', 'CSV']]);
   formModal('Обработать сохранённый результат', fields(field('Обработка', processing), field('Формат результата', format)),
     'Создать файл', async () => {
-      await call('export', { runId, source, processingId: processing.value, format: format.value });
+      await call('export', { runId, source, workbook, processingId: processing.value, format: format.value });
       await runDetails(runId);
       showToast('Файл обработки готов.');
     });

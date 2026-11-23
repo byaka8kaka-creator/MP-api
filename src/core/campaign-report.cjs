@@ -11,6 +11,68 @@ const campaignColumns = [
   { path: 'campaignReport.articles', name: 'Артикул WB' }, { path: 'campaignReport.brand', name: 'Бренд' },
 ];
 const summaryHeaders = ['Бренд', 'Начало периода', 'Конец периода', ...metrics.map(([, name]) => name)];
+const roles = [
+  ['statistic', 'GET', '/adv/v3/fullstats', ''],
+  ['adverts', 'GET', '/api/advert/v3/adverts', 'adverts'],
+  ['products', 'POST', '/api/analytics/v3/sales-funnel/products', 'data.products'],
+];
+
+function matches(template, [, method, path, rows]) {
+  return template?.method === method && template.path === path && pathParts(template.response.rows).join('.') === rows;
+}
+
+function dateFields(template) {
+  return ['beginDate', 'endDate'].map(key => ({ name: key,
+    path: template.parameters.find(parameter => parameter.where === 'query' && parameter.key === key)?.name }));
+}
+
+function campaignRecipe(templates) {
+  const matched = roles.map(role => templates.find(template => matches(template, role)));
+  if (matched.some(template => !template)) return null;
+  const statistic = matched[0];
+  const periods = dateFields(statistic);
+  if (periods.some(period => !period.path)) return null;
+  const sources = roles.map(([alias], index) => ({ alias, templateId: matched[index].id,
+    ...(alias === 'statistic' ? { allRows: true, requestFields: periods } : {}) }));
+  const readColumns = fields => fields.length ? fields : [{ path: '$', name: 'Запись' }];
+  const main = readColumns(statistic.response.columns).filter(column => !campaignColumns.some(extra => extra.name === column.name));
+  const steps = [
+    { type: 'copy', input: 'products', output: 'productBrands', fields: [
+      { from: 'product.nmId', to: 'nmId' }, { from: 'product.brandName', to: 'brand', trim: true },
+    ] },
+    { type: 'filter', input: 'productBrands', output: 'knownBrands', path: 'brand', operator: 'notBlank' },
+    { type: 'expandArray', input: 'adverts', output: 'campaignItems', path: 'nms', as: 'item' },
+    { type: 'copy', input: 'campaignItems', output: 'campaignItemIds', fields: [
+      { from: 'advertId', to: 'advertId' }, { from: 'item.nmId', to: 'nmId' },
+    ] },
+    { type: 'validate', input: 'campaignItemIds', output: 'knownItems', onError: 'skip', checks: [{ path: 'nmId', kind: 'present' }] },
+    { type: 'join', input: 'knownItems', output: 'itemsWithBrands', right: 'knownBrands', as: 'product', matches: 'unique',
+      keys: [{ left: 'nmId', right: 'nmId', type: 'integer' }] },
+    { type: 'join', input: 'statistic', output: 'campaignMatches', right: 'itemsWithBrands', as: 'items', matches: 'list',
+      keys: [{ left: 'advertId', right: 'advertId', type: 'integer' }] },
+    { type: 'collect', input: 'campaignMatches', output: 'campaignArticles', path: 'items', value: 'nmId', as: 'articles' },
+    { type: 'collect', input: 'campaignArticles', output: 'campaignBrands', path: 'items', value: 'product.brand', as: 'brand',
+      separator: ' / ', missing: unknownBrand },
+    { type: 'validate', input: 'campaignBrands', output: 'datedCampaigns', checks: [{ path: 'advertId', kind: 'present' },
+      { path: 'request.beginDate', kind: 'dateInterval', endPath: 'request.endDate' }] },
+    { type: 'distinct', input: 'datedCampaigns', output: 'uniqueCampaigns', keys: [{ path: 'advertId', type: 'integer' },
+      { path: 'request.beginDate' }, { path: 'request.endDate' }] },
+    { type: 'allocate', input: 'uniqueCampaigns', output: 'brandMetrics', items: 'items', label: 'product.brand', itemKey: 'nmId',
+      details: 'days.apps.nms', detailKey: 'nmId', as: 'allocated', multiple: 'reconcile', unknown: unknownBrand, mixed: mixedBrands,
+      metrics: metrics.map(([key]) => ({ total: key, detail: key, name: key })) },
+    { type: 'group', input: 'brandMetrics', output: 'summary', uniform: 'currency', keys: [
+      { path: 'request.beginDate', name: 'begin' }, { path: 'request.endDate', name: 'end' }, { path: 'allocated.group', name: 'brand' },
+    ], metrics: metrics.map(([key]) => ({ path: `allocated.${key}`, name: key, op: 'sum' })) },
+  ];
+  const sheets = [
+    { name: statistic.name, input: 'campaignBrands', expand: statistic.response.expand, columns: [...main,
+      { path: 'articles', name: 'Артикул WB' }, { path: 'brand', name: 'Бренд' }] },
+    ...statistic.response.tables.map(table => ({ name: table.name, input: 'statistic', expand: table.path, separate: true, columns: readColumns(table.columns) })),
+    { name: 'Свод РК', input: 'summary', columns: ['brand', 'begin', 'end', ...metrics.map(([key]) => key)]
+      .map((path, index) => ({ path, name: summaryHeaders[index] })) },
+  ];
+  return { scope: 'workbook', name: 'Свод РК', sources, steps, sheets };
+}
 
 function validPeriod(begin, end) {
   return dateMs(begin) <= dateMs(end);
@@ -18,23 +80,15 @@ function validPeriod(begin, end) {
 
 function planCampaignReport(sources) {
   const entries = sources.filter(source => !source.isDependency);
-  const roles = [
-    ['statistic', 'GET', '/adv/v3/fullstats', ''],
-    ['adverts', 'GET', '/api/advert/v3/adverts', 'adverts'],
-    ['products', 'POST', '/api/analytics/v3/sales-funnel/products', 'data.products'],
-  ];
-  const indices = Object.fromEntries(roles.map(([role, method, path, rows]) => [role, sources.findIndex(source =>
-    !source.isDependency && source.template.method === method && source.template.path === path &&
-    pathParts(source.template.response.rows).join('.') === rows)]));
+  const indices = Object.fromEntries(roles.map(role => [role[0], sources.findIndex(source =>
+    !source.isDependency && matches(source.template, role))]));
   demand(entries.length === 3 && Object.values(indices).every(index => index >= 0),
     'Для «Свода РК» добавьте три шаблона: fullstats с путём $, adverts с путём adverts и воронку с путём data.products.');
   const statistic = sources[indices.statistic];
   const products = sources[indices.products];
   demand(!statistic.processing, 'У источника fullstats выберите «Без обработки», чтобы сохранить листы шаблона.');
 
-  const dateParameter = key => statistic.template.parameters.find(parameter => parameter.where === 'query' && parameter.key === key)?.name;
-  const beginDate = dateParameter('beginDate');
-  const endDate = dateParameter('endDate');
+  const [{ path: beginDate }, { path: endDate }] = dateFields(statistic.template);
   demand(beginDate && endDate && validPeriod(statistic.values[beginDate], statistic.values[endDate]),
     'Укажите начало и конец периода в источнике fullstats.');
   const { body } = requestFor(products, products.values, initialPosition(products.template.pagination));
@@ -160,4 +214,4 @@ async function* campaignSummaryRows(records, lookups) {
   for (const { brand, begin, end, totals } of sorted) yield [brand, begin, end, ...totals];
 }
 
-module.exports = { campaignColumns, campaignLookups, campaignRows, campaignSummaryRows, planCampaignReport, summaryHeaders };
+module.exports = { campaignColumns, campaignLookups, campaignRecipe, campaignRows, campaignSummaryRows, planCampaignReport, summaryHeaders };

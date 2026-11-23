@@ -5,10 +5,11 @@ const path = require('node:path');
 const { createInterface } = require('node:readline');
 const { finished } = require('node:stream/promises');
 const ExcelJS = require('exceljs');
-const { InputError, get, inferShape, isLosslessNumber, parseJson, publicValue, scalarText, stringify } = require('./json.cjs');
-const { demand } = require('./model.cjs');
+const { InputError, get, inferShape, isLosslessNumber, object, parseJson, publicValue, scalarText, stringify } = require('./json.cjs');
+const { batches, demand } = require('./model.cjs');
 const { processingRows, processingSteps, recordSample } = require('./processings.cjs');
 const { campaignColumns, campaignLookups, campaignRows, campaignSummaryRows, summaryHeaders } = require('./campaign-report.cjs');
+const { workbookBindings, workbookExecutor } = require('./workbook-processing.cjs');
 
 const XLSX_ROWS = 1_048_575;
 const DAY = 86_400_000;
@@ -56,12 +57,29 @@ async function sample(store, runId, source) {
   };
 }
 
-async function* records(store, run, sourceIndex, signal) {
+async function* records(store, run, sourceIndex, signal, options) {
   const source = run.snapshot.sources[sourceIndex];
   demand(source, 'Набор данных отсутствует.');
-  const keyPath = source.template.response.deduplicateBy;
+  const keyPath = options?.allRows ? undefined : source.template.response.deduplicateBy;
   const seen = keyPath === undefined ? null : new Set();
+  const requestBatches = options?.requestFields?.length ? batches(source, source.resolved ?? source.values) : null;
+  let batch = -1;
+  let request;
   for (const page of store.pages(run.id, sourceIndex)) {
+    if (requestBatches && batch < page.batch) {
+      let values;
+      while (batch < page.batch) {
+        const next = requestBatches.next();
+        demand(!next.done, `Для «${options.alias}» отсутствуют параметры сохранённого запроса.`);
+        values = next.value;
+        batch++;
+      }
+      request = Object.fromEntries(options.requestFields.map(field => {
+        const value = get(values, field.path);
+        demand(value !== undefined, `Для «${options.alias}» заполните параметр запроса «${field.path}».`);
+        return [field.name, value];
+      }));
+    }
     const stream = createReadStream(pageFile(store, run.id, sourceIndex, page.batch, page.page), { encoding: 'utf8', signal });
     const lines = createInterface({ input: stream, crlfDelay: Infinity });
     try {
@@ -76,7 +94,10 @@ async function* records(store, run, sourceIndex, signal) {
             seen.add(encoded);
           }
         }
-        yield row;
+        if (request) {
+          demand(object(row) && (row.request === undefined || object(row.request)), 'Поля запроса можно добавить к объекту записи.');
+          yield { ...row, request: { ...row.request, ...request } };
+        } else yield row;
       }
     } finally {
       lines.close();
@@ -94,6 +115,7 @@ async function* outputRecords(store, run, index, processing = run.snapshot.sourc
 }
 
 async function previewProcessing(store, run, index, processing) {
+  if (processing.scope === 'workbook') return previewWorkbook(store, run, processing);
   const steps = processingSteps(processing);
   const input = { rows: 0, samples: [] };
   const stages = steps.map(step => ({ type: step.type, input: 0, rows: 0, errors: 0, samples: [] }));
@@ -218,6 +240,10 @@ function sourceTables(source, readRows, processing, extraColumns = []) {
 }
 
 async function tables(store, run, override, sourceIndex) {
+  if (override?.scope === 'workbook' || (!override && run.snapshot.workbook)) {
+    return workbookTables(store, run, override ?? run.snapshot.workbook.processing,
+      override ? undefined : run.snapshot.workbook.bindings).definitions;
+  }
   if (!override && run.snapshot.campaignReport) {
     const { statistic, adverts, products } = run.snapshot.campaignReport;
     const lookups = await campaignLookups(records(store, run, adverts), records(store, run, products));
@@ -231,6 +257,39 @@ async function tables(store, run, override, sourceIndex) {
     const processing = override ?? source.processing;
     return sourceTables(source, () => outputRecords(store, run, index, processing), processing);
   });
+}
+
+function workbookTables(store, run, processing, indices, preview = false) {
+  const bindings = indices ?? workbookBindings(processing, run.snapshot.sources);
+  const executor = workbookExecutor(processing,
+    source => records(store, run, bindings[source.alias], undefined, source), preview);
+  const definitions = processing.sheets.map(sheet => ({
+    name: sheet.name, headers: sheet.columns.map(column => column.name),
+    rows: tabularRows(executor.rows(sheet.input), sheet.columns, sheet.expand, sheet.separate), rowCount: 0,
+  }));
+  return { ...executor, definitions };
+}
+
+async function previewWorkbook(store, run, processing) {
+  const { definitions, stages } = workbookTables(store, run, processing, undefined, true);
+  const sheets = definitions.map(table => ({ name: table.name, rows: 0, samples: [], used: false }));
+  let error;
+  try {
+    for (const [index, table] of definitions.entries()) {
+      const sheet = sheets[index];
+      sheet.used = true;
+      for await (const cells of table.rows) {
+        if (sheet.samples.length < 3) recordSample(sheet, Object.fromEntries(table.headers.map((name, column) => [name, cells[column]])));
+        else sheet.rows++;
+      }
+    }
+  } catch (failure) {
+    if (!(failure instanceof InputError)) throw failure;
+    error = failure.message;
+  } finally {
+    for (const table of definitions) await table.rows.return();
+  }
+  return { scope: 'workbook', stages, sheets, error };
 }
 
 function fileName(value, max = 80) {
@@ -325,7 +384,7 @@ async function writeXlsx(dir, name, definitions, rowLimit) {
 
 async function exportRun(store, run, format, { rowLimit = XLSX_ROWS, processing, sourceIndex } = {}) {
   demand(['xlsx', 'csv'].includes(format), 'Выберите XLSX или CSV.');
-  const sources = processing ? { [sourceIndex]: run.progress.sources?.[sourceIndex] }
+  const sources = processing && processing.scope !== 'workbook' ? { [sourceIndex]: run.progress.sources?.[sourceIndex] }
     : Object.fromEntries(Object.entries(run.progress.sources ?? {}).filter(([index]) => !run.snapshot.sources[index]?.isDependency));
   demand(run.snapshot.sources.length && Object.values(sources).some(source =>
     source?.rows > 0 || source?.state === 'completed'), 'Доступных результатов для экспорта нет.');

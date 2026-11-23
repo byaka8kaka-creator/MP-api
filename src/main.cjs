@@ -254,7 +254,7 @@ async function actions(action, value) {
     case 'deleteProcessing':
       return service.deleteProcessing(user, value.processingId);
     case 'processingRuns':
-      return service.processingRuns(user, value.templateId);
+      return service.processingRuns(user, value.templateId, value.sourcesJson === undefined ? undefined : readJson(value.sourcesJson, 'Источники'));
     case 'processingPreview': {
       const { runId, sourceIndex, processing } = service.processingPreview(user, {
         ...readJson(value.json, 'Обработка'), runId: value.runId, source: value.source,
@@ -293,7 +293,7 @@ async function actions(action, value) {
     case 'openOutput': {
       const run = service.getRun(user, value.runId);
       const output = value.processingId
-        ? run.progress.processingExports?.[`${value.source}:${id(value.processingId)}`]?.path
+        ? run.progress.processingExports?.[`${value.workbook === true ? 'workbook' : value.source}:${id(value.processingId)}`]?.path
         : run.progress.exportPath;
       demand(output, 'Для этого результата ещё нет файлов экспорта.');
       demand(!await shell.openPath(output), 'Не удалось открыть папку экспорта.');

@@ -35,7 +35,8 @@ port.on('message', async ({ data }) => {
       const latest = store.run(runId);
       if (processing) {
         latest.progress.processingExports ??= {};
-        latest.progress.processingExports[`${sourceIndex}:${processing.id}`] = {
+        const key = processing.scope === 'workbook' ? 'workbook' : sourceIndex;
+        latest.progress.processingExports[`${key}:${processing.id}`] = {
           name: processing.name, path: output, format: data.format, finishedAt: Date.now(),
         };
       } else {

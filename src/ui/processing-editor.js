@@ -21,7 +21,7 @@ function processingList(items, make, blank, addLabel, chooser) {
         btn('Ниже', () => move(index, 1), 'compact ghost', index === rows.length - 1),
         btn('Убрать', () => { rows.splice(index, 1); render(); }, 'compact ghost'));
       if (row.summary) {
-        row.summary.textContent = `${index + 1}. ${row.title}`;
+        row.summary.replaceChildren(`${index + 1}. ${row.title}`, row.summarySuffix ?? '');
         return h('section', { class: 'recipe-item recipe-step' }, row.node, actions);
       }
       return h('section', { class: 'recipe-item' },
@@ -29,25 +29,32 @@ function processingList(items, make, blank, addLabel, chooser) {
     }));
   }
   render();
+  function append(items, open = true) {
+    rows.push(...items.map(item => make(item, open)));
+    render();
+  }
   return {
-    node: stack(list, h('div', { class: 'recipe-add' }, chooser, btn(addLabel, () => {
-      rows.push(make(blank(), true));
-      render();
-    }, 'compact'))),
+    node: stack(list, h('div', { class: 'recipe-add' }, chooser, btn(addLabel, () => append([blank()]), 'compact'))),
+    append,
     value: () => rows.map(row => row.value()),
   };
 }
 
-function editProcessingStep(step, open = false) {
-  if (!step || !Object.hasOwn(stepNames, step.type)) throw new Error('Укажите поддерживаемый тип шага.');
+function editProcessingStep(step, open = false, workbook) {
+  const isRowStep = step && Object.hasOwn(stepNames, step.type);
+  if (!isRowStep && (!workbook || !step || !Object.hasOwn(workbook.names, step.type))) {
+    throw new Error('Укажите поддерживаемый тип шага.');
+  }
   const onError = select([['stop', 'Остановить обработку'], ['skip', 'Пропустить запись']], step.onError ?? 'stop');
-  const controls = stepControls(step);
+  const controls = isRowStep ? stepControls(step) : workbook.controls(step);
+  const names = workbook?.datasets(step);
   const summary = h('summary');
   return {
-    title: stepNames[step.type],
+    title: isRowStep ? stepNames[step.type] : workbook.names[step.type],
     summary,
-    node: h('details', { open }, summary, stack(controls.node, field('При ошибке', onError))),
-    value: () => ({ type: step.type, ...controls.value(), onError: onError.value }),
+    summarySuffix: names?.suffix,
+    node: h('details', { open }, summary, stack(names?.node, controls.node, field('При ошибке', onError))),
+    value: () => ({ type: step.type, ...names?.value(), ...controls.value(), onError: onError.value }),
   };
 }
 
@@ -56,7 +63,7 @@ function stepControls(step) {
     case 'filter': {
       const path = input(step.path ?? '', { placeholder: 'dailyStats' });
       const operator = select([['present', 'Поле присутствует'], ['arrayNotEmpty', 'Массив содержит элементы'],
-        ['equals', 'Равно'], ['notEquals', 'Не равно']], step.operator ?? 'present');
+        ['notBlank', 'Текст заполнен'], ['equals', 'Равно'], ['notEquals', 'Не равно']], step.operator ?? 'present');
       const compare = () => ['equals', 'notEquals'].includes(operator.value);
       const target = textarea(pretty(step.value ?? null), 2, 'Значение для сравнения');
       const comparison = field('Значение (JSON)', target);
@@ -107,8 +114,9 @@ function stepControls(step) {
       const mapped = processingList(step.fields ?? [{}], item => {
         const from = input(item.from ?? '', { placeholder: 'day.stat' });
         const to = input(item.to ?? '', { placeholder: 'stat' });
-        return { node: fields(field('Откуда взять значение', from), field('Имя выходного поля', to)),
-          value: () => ({ from: from.value, to: to.value }) };
+        const trim = checkbox('Убрать пробелы по краям текста', item.trim);
+        return { node: stack(fields(field('Откуда взять значение', from), field('Имя выходного поля', to)), trim.label),
+          value: () => ({ from: from.value, to: to.value, ...(trim.control.checked ? { trim: true } : {}) }) };
       }, () => ({}), 'Добавить поле');
       const keepOriginal = checkbox('Сохранить остальные поля строки', step.keepOriginal);
       return { node: stack(keepOriginal.label, mapped.node),
@@ -117,16 +125,20 @@ function stepControls(step) {
   }
 }
 
-function processingBuilder(recipe) {
-  const stepType = select(Object.entries(stepNames));
-  const steps = processingList(recipe.steps, editProcessingStep, () => ({ type: stepType.value }),
-    'Добавить шаг', field('Новый шаг', stepType));
-  const columns = processingList(recipe.columns, item => {
+function processingColumns(items) {
+  return processingList(items, item => {
     const path = input(item.path, { placeholder: 'stat.normQuery' });
     const name = input(item.name);
     return { node: fields(field('Путь к полю', path), field('Название колонки', name)),
       value: () => ({ path: path.value, name: name.value }) };
   }, () => ({ path: '$', name: '' }), 'Добавить колонку');
+}
+
+function processingBuilder(recipe) {
+  const stepType = select(Object.entries(stepNames));
+  const steps = processingList(recipe.steps, editProcessingStep, () => ({ type: stepType.value }),
+    'Добавить шаг', field('Новый шаг', stepType));
+  const columns = processingColumns(recipe.columns);
   return {
     node: stack(h('h3', {}, 'Шаги обработки'), steps.node,
       h('details', { class: 'fold recipe-columns' }, h('summary', {}, 'Колонки результата'), columns.node)),
@@ -149,9 +161,14 @@ function showProcessingPreview(result) {
 }
 
 function processingEditor(saved) {
-  const choices = state.workspace.options.filter(item => !item.archived || item.id === saved?.templateId);
+  const existingTemplates = new Set(saved?.sources?.map(source => source.templateId) ?? [saved?.templateId]);
+  const choices = state.workspace.options.filter(item => !item.archived || existingTemplates.has(item.id));
+  const scope = select([['source', 'Один источник'], ['workbook', 'Вся выгрузка']], saved?.scope ?? 'source');
+  scope.disabled = Boolean(saved);
+  const isWorkbook = () => scope.value === 'workbook';
   const template = select(choices.map(item => [item.id, `${item.connection} · ${item.name}`]), saved?.templateId);
   template.disabled = Boolean(saved);
+  const templateField = field('Шаблон запроса', template);
   const getDefaults = () => choices.find(item => item.id === template.value).processingDefaults;
   let defaults = getDefaults();
   const name = input(saved?.name ?? defaults.name, { required: true, maxlength: 160 });
@@ -161,20 +178,22 @@ function processingEditor(saved) {
   const result = stack();
   let builder;
   let mode = 'steps';
-  const useSteps = recipe => {
-    builder = processingBuilder(recipe);
+  const useSteps = value => {
+    builder = isWorkbook() ? workbookBuilder(value, choices) : processingBuilder(value);
     mode = 'steps';
     pane.replaceChildren(builder.node);
   };
-  useSteps(saved ? parseEditable(saved.recipeJson) : defaults);
   const recipe = () => {
-    const value = mode === 'json' ? editedJson(raw.value, 'Шаги и колонки') : builder.value();
-    if (!Array.isArray(value?.steps) || !Array.isArray(value?.columns)) throw new Error('Укажите массивы steps и columns.');
+    const value = mode === 'json' ? editedJson(raw.value, isWorkbook() ? 'Обработка выгрузки' : 'Шаги и колонки') : builder.value();
+    if (isWorkbook()) {
+      if (![value?.sources, value?.steps, value?.sheets].every(Array.isArray)) throw new Error('Укажите массивы sources, steps и sheets.');
+    } else if (![value?.steps, value?.columns].every(Array.isArray)) throw new Error('Укажите массивы steps и columns.');
     return value;
   };
   const payload = () => {
-    const { steps, columns } = recipe();
-    return pretty({ id: saved?.id, templateId: template.value, name: name.value, steps, columns });
+    const { sources, steps, sheets, columns } = recipe();
+    return pretty({ id: saved?.id, name: name.value, scope: scope.value, steps,
+      ...(isWorkbook() ? { sources, sheets } : { templateId: template.value, columns }) });
   };
 
   const modeChoice = select([['steps', 'Конструктор шагов'], ['json', 'JSON']]);
@@ -187,6 +206,7 @@ function processingEditor(saved) {
         pane.replaceChildren(raw);
       } else {
         useSteps(recipe());
+        if (isWorkbook()) loadRuns();
       }
     } catch (error) {
       editorError.textContent = error.message;
@@ -210,7 +230,7 @@ function processingEditor(saved) {
     const generation = ++previewRequest;
     try {
       const data = await call('processingPreview', { json: payload(), runId: selected.runId, source: selected.source });
-      if (generation === previewRequest) result.replaceChildren(showProcessingPreview(data));
+      if (generation === previewRequest) result.replaceChildren(data.scope === 'workbook' ? showWorkbookPreview(data) : showProcessingPreview(data));
     } catch (error) {
       if (generation === previewRequest) result.replaceChildren(h('p', { class: 'notice error' }, error.message));
     } finally {
@@ -226,13 +246,15 @@ function processingEditor(saved) {
     available.textContent = 'Загружаем список запусков…';
     result.replaceChildren();
     try {
-      const runs = await call('processingRuns', { templateId: template.value });
+      const workbook = isWorkbook();
+      const runs = await call('processingRuns', workbook ? { sourcesJson: pretty(recipe().sources) } : { templateId: template.value });
       if (generation !== loadRequest) return;
       candidates = runs;
       runSelect.append(...runs.map((run, index) => h('option', { value: index + 1 },
-        `${time(run.created)} · ${run.name} · источник ${run.source + 1} · ${number.format(run.rows)} строк`)));
+        [time(run.created), run.name, workbook ? '' : `источник ${run.source + 1}`, `${number.format(run.rows)} строк`].filter(Boolean).join(' · '))));
       runSelect.value = runs.length ? '1' : '';
-      available.textContent = runs.length ? '' : 'Для этого шаблона пока нет сохранённых запусков.';
+      available.textContent = runs.length ? '' : workbook ? 'Пока нет сохранённого запуска со всеми выбранными источниками.'
+        : 'Для этого шаблона пока нет сохранённых запусков.';
       preview.disabled = busy || !runSelect.value;
     } catch (error) {
       if (generation === loadRequest) available.textContent = error.message;
@@ -243,20 +265,41 @@ function processingEditor(saved) {
     preview.disabled = busy || !runSelect.value;
     result.replaceChildren();
   });
+  const reload = btn('Обновить список запусков', loadRuns, 'compact');
+  const preset = state.workspace.campaignPreset ? parseEditable(state.workspace.campaignPreset) : null;
+  const loadPreset = btn('Загрузить пример «Свод РК»', () => {
+    name.value = preset.name;
+    openRecipe(preset);
+    loadRuns();
+  });
+  function openRecipe(value) {
+    useSteps(value);
+    modeChoice.value = 'steps';
+    editorError.hidden = true;
+    templateField.hidden = isWorkbook();
+    reload.hidden = !isWorkbook();
+    loadPreset.hidden = !isWorkbook() || !preset || Boolean(saved);
+    raw.setAttribute('aria-label', isWorkbook() ? 'Источники, шаги и листы JSON' : 'Шаги и колонки JSON');
+  }
+  scope.addEventListener('change', () => {
+    const workbook = { sources: [{ alias: 'source1', templateId: template.value }], steps: [],
+      sheets: [{ name: 'Результат', input: 'source1', columns: [{ path: '$', name: 'Запись' }] }] };
+    openRecipe(isWorkbook() ? workbook : defaults);
+    loadRuns();
+  });
   template.addEventListener('change', () => {
     const next = getDefaults();
     if (!name.value.trim() || name.value === defaults.name) name.value = next.name;
     defaults = next;
-    useSteps(next);
-    modeChoice.value = 'steps';
-    editorError.hidden = true;
+    openRecipe(next);
     loadRuns();
   });
+  openRecipe(saved ? parseEditable(saved.recipeJson) : defaults);
   formModal(saved ? 'Изменить обработку' : 'Новая обработка', [
-    fields(field('Название', name), field('Шаблон запроса', template)),
-    field('Режим редактирования', modeChoice), editorError, pane,
+    fields(field('Название', name), field('Область обработки', scope)), templateField,
+    fields(field('Режим редактирования', modeChoice), cluster(loadPreset)), editorError, pane,
     h('details', { class: 'fold', open: true }, h('summary', {}, 'Проверка на сохранённом запуске'),
-      stack(field('Запуск для предпросмотра', runSelect), available, cluster(preview), result)),
+      stack(field('Запуск для предпросмотра', runSelect), available, cluster(preview, reload), result)),
   ], 'Сохранить', async () => {
     await call('processing', { json: payload() });
     await done('Обработка сохранена.');

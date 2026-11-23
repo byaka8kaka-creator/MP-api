@@ -832,6 +832,26 @@ test('«Свод РК» объединяет три запроса и сумми
   assert.throws(() => service.saveJob(user, { ...job, entries: job.entries.slice(1) }), /три шаблона/);
   assert.throws(() => service.saveJob(user, { ...job, entries: [{ templateId: productsId }, ...job.entries.slice(1)] }), /selectedPeriod/);
   const jobId = service.saveJob(user, job);
+  assert.equal(store.processing(store.job(jobId).value.workbookProcessingId).scope, 'workbook');
+
+  const oldJob = { ...job, id: 'legacy-campaign', schedule: { days: [1], time: '08:00' } };
+  store.putJob(oldJob, user.id, false);
+  store.scheduleJob(oldJob.id, 100, 200, 300);
+  const oldRunId = service.createRun(user, { kind: 'job', jobId: oldJob.id });
+  const upgraded = new Service(store, null);
+  const migrated = store.job(oldJob.id);
+  assert.deepEqual([migrated.schedule_cursor, migrated.pending_at, migrated.pending_slot], [100, 200, 300]);
+  assert.deepEqual(migrated.value.entries, oldJob.entries);
+  assert.deepEqual(migrated.value.schedule, oldJob.schedule);
+  assert.equal(migrated.value.campaignReport, undefined);
+  assert.ok(store.run(oldRunId).snapshot.campaignReport);
+  assert.equal(store.run(oldRunId).snapshot.workbook, undefined);
+  const migratedRecipe = store.processing(migrated.value.workbookProcessingId);
+  assert.deepEqual(migratedRecipe.sources.map(source => source.templateId), [statsId, advertsId, productsId]);
+  assert.equal(upgraded.workspace(user).processings.filter(item => item.id === migratedRecipe.id).length, 1);
+  new Service(store, null);
+  assert.equal(store.job(oldJob.id).value.workbookProcessingId, migratedRecipe.id);
+
   const runId = service.createRun(user, { kind: 'job', jobId });
   await fx.run(runId);
   const run = store.run(runId);
@@ -865,6 +885,79 @@ test('«Свод РК» объединяет три запроса и сумми
   await reopened.xlsx.readFile(path.join(exportedAgain, files.find(filename => filename.endsWith('.xlsx'))));
   assert.deepEqual(reopened.getWorksheet('Свод РК').getSheetValues(), book.getWorksheet('Свод РК').getSheetValues());
   assert.equal(requests.length, requestCount);
+});
+
+test('обработка всей выгрузки соединяет сохранённые наборы и редактирует итоги и листы', async t => {
+  const longId = '9223372036854775807';
+  const sales = [
+    { shop: 'WB', sku: parseJson(longId), amount: 5 }, { shop: 'WB', sku: longId, amount: 2 },
+    { shop: 'WB', sku: 4, amount: 8 }, { shop: 'WB', sku: 5, amount: 10 }, { shop: 'WB', sku: 5 },
+    { shop: 'WB', sku: 9, amount: 1 }, { shop: 'Ozon', sku: 5, amount: 4 },
+  ];
+  const dictionary = [
+    { shop: 'WB', article: longId, brand: 'Альфа' }, { shop: 'WB', article: longId, brand: 'Альфа' },
+    { shop: 'WB', article: 4, brand: 'Альфа' }, { shop: 'WB', article: 4, brand: 'Бета' },
+    { shop: 'WB', article: 5, brand: 'Бета' }, { shop: 'Ozon', article: 5, brand: 'Гамма' },
+  ];
+  const fx = await fixture(t, request => ({ body: stringify({ rows: request.url.pathname === '/sales' ? sales : dictionary }) }));
+  const { service, store, user } = fx;
+  function publish(name, path) {
+    const templateId = service.saveDraft(user, stringify({ name, path, method: 'GET', connectionId: 'wildberries',
+      endpointId: 'marketplace', available: true, response: { rows: 'rows' } }));
+    service.publish(user, templateId);
+    return templateId;
+  }
+  const salesId = publish('Продажи', '/sales');
+  const dictionaryId = publish('Товары', '/dictionary');
+  const entries = [{ templateId: salesId }, { templateId: dictionaryId }];
+  const job = { name: 'Заказы и товары', format: 'xlsx', entries };
+  const jobId = service.saveJob(user, job);
+  const runId = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(runId);
+  const run = store.run(runId);
+  assert.equal(run.state, 'completed');
+  const config = { name: 'Свод продаж', scope: 'workbook', sources: [
+    { alias: 'sales', templateId: salesId }, { alias: 'dictionary', templateId: dictionaryId },
+  ], steps: [
+    { type: 'join', input: 'sales', output: 'joined', right: 'dictionary', as: 'item', matches: 'unique', keys: [
+      { left: 'shop', right: 'shop', type: 'text' }, { left: 'sku', right: 'article', type: 'integer' },
+    ] },
+    { type: 'group', input: 'joined', output: 'summary', keys: [{ path: 'item.brand', name: 'brand' }], metrics: [
+      { name: 'total', op: 'sum', path: 'amount' }, { name: 'rows', op: 'count' },
+      { name: 'articles', op: 'countDistinct', path: 'item.article' }, { name: 'minimum', op: 'min', path: 'amount' },
+    ] },
+  ], sheets: [
+    { name: 'Заказы', input: 'joined', columns: [{ path: 'sku', name: 'Товар' }, { path: 'item.brand', name: 'Бренд' }] },
+    { name: 'Итоги', input: 'summary', columns: ['brand', 'total', 'rows', 'articles', 'minimum'].map(path => ({ path, name: path })) },
+  ] };
+  const processingId = service.saveProcessing(user, config);
+  assert.deepEqual(service.runSummary(user, runId).workbookChoices, [processingId]);
+  assert.equal(service.processingRuns(user, undefined, config.sources)[0].rows, sales.length + dictionary.length);
+  const preview = service.processingPreview(user, { ...config, runId });
+  const result = await previewProcessing(store, run, preview.sourceIndex, preview.processing);
+  const join = result.stages.find(stage => stage.alias === 'joined');
+  assert.deepEqual([join.input, join.rows, join.unmatched, join.conflicts, join.errors], [7, 7, 2, 1, 0]);
+  assert.deepEqual(result.sheets.map(sheet => [sheet.name, sheet.rows]), [['Заказы', 7], ['Итоги', 4]]);
+  assert.equal(result.error, undefined);
+  const strict = service.processingPreview(user, { ...config, runId,
+    steps: [{ ...config.steps[0], missing: 'error' }, config.steps[1]] });
+  assert.match((await previewProcessing(store, run, undefined, strict.processing)).error, /joined.*совпадение/);
+  assert.throws(() => service.saveJob(user, { ...job, entries: [...entries, entries[1]], workbookProcessingId: processingId }), /номер источника/);
+  service.saveJob(user, { ...job, id: jobId, workbookProcessingId: processingId });
+  assert.throws(() => service.deleteProcessing(user, processingId), /Заказы и товары/);
+  const planned = service.createRun(user, { kind: 'job', jobId });
+  assert.deepEqual(store.run(planned).snapshot.workbook.bindings, { sales: 0, dictionary: 1 });
+  service.saveProcessing(user, { ...config, id: processingId, sheets: [config.sheets[0], { ...config.sheets[1], name: 'Итоги продаж' }] });
+  assert.equal(store.run(planned).snapshot.workbook.processing.sheets[1].name, 'Итоги');
+  const override = service.processingFromRun(user, run, { workbook: true, processingId });
+  const output = await exportRun(store, run, 'xlsx', override);
+  const book = new ExcelJS.Workbook();
+  await book.xlsx.readFile(path.join(output, 'Свод продаж.xlsx'));
+  assert.deepEqual(book.worksheets.map(sheet => sheet.name), ['Заказы', 'Итоги продаж']);
+  assert.equal(book.worksheets[0].getCell('A2').value, longId);
+  const rows = book.getWorksheet('Итоги продаж').getSheetValues().slice(2).map(row => [row[1] ?? null, ...row.slice(2)]);
+  assert.deepEqual(rows, [[null, 9, 2, 0, 1], ['Альфа', 7, 2, 1, 2], ['Бета', 10, 2, 1, 10], ['Гамма', 4, 1, 1, 4]]);
+  assert.equal(fx.requests.length, 2);
 });
 
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {

@@ -179,6 +179,7 @@ textarea.code { font: 12px/1.55 'Cascadia Code', Consolas, monospace; background
 .recipe-step { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
 .recipe-step summary { padding: 5px 0; cursor: pointer; font-weight: 640; }
 .recipe-step details[open] > summary { margin-bottom: 8px; }
+.recipe-output { margin-left: 9px; overflow-wrap: anywhere; }
 .recipe-add { display: flex; gap: 8px; align-items: end; }
 .recipe-columns .recipe-list { max-height: 365px; overflow: auto; }
 .fold { padding: 9px 11px; border: 1px solid var(--line); border-radius: 8px; background: #fbfdfb; }

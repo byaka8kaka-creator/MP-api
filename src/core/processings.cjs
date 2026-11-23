@@ -113,7 +113,7 @@ function validateStep(step) {
   switch (step.type) {
     case 'filter': {
       const { operator, value } = step;
-      demand(['present', 'arrayNotEmpty', 'equals', 'notEquals'].includes(operator), 'Укажите условие фильтра.');
+      demand(['present', 'notBlank', 'arrayNotEmpty', 'equals', 'notEquals'].includes(operator), 'Укажите условие фильтра.');
       const comparison = operator === 'equals' || operator === 'notEquals';
       demand(!comparison || value !== undefined, 'Укажите значение для сравнения.');
       return { ...config, path: fieldPath(step.path), operator, ...(comparison ? { value } : {}) };
@@ -138,7 +138,7 @@ function validateStep(step) {
     }
     case 'copy': {
       const fields = stepList(step.fields, 'Добавьте поле для переноса.', field => ({
-        from: fieldPath(field.from), to: id(field.to),
+        from: fieldPath(field.from), to: id(field.to), ...(field.trim === true ? { trim: true } : {}),
       }));
       demand(new Set(fields.map(field => field.to)).size === fields.length, 'Имена выходных полей должны различаться.');
       return { ...config, fields, keepOriginal: step.keepOriginal === true };
@@ -172,6 +172,7 @@ function processingSteps(processing) {
 function matchesFilter(row, step) {
   const value = get(row, step.path);
   if (step.operator === 'present') return value != null;
+  if (step.operator === 'notBlank') return typeof value === 'string' && Boolean(value.trim());
   if (step.operator === 'arrayNotEmpty') {
     demand(value == null || Array.isArray(value), `Поле «${step.path}» должно быть массивом.`);
     return Boolean(value?.length);
@@ -226,7 +227,7 @@ function* stepRows(step, row) {
       const result = step.keepOriginal ? { ...row } : {};
       for (const field of step.fields) {
         const value = get(row, field.from);
-        if (value !== undefined) result[field.to] = value;
+        if (value !== undefined) result[field.to] = field.trim && typeof value === 'string' ? value.trim() : value;
       }
       yield result;
       break;
@@ -263,4 +264,4 @@ function processingRows(steps, record, trace) {
 }
 
 module.exports = { CLUSTERS_COLUMNS, CLUSTERS_PATH, FUNNEL_COLUMNS, FUNNEL_PATH, processingDefaults,
-  processingRows, processingSteps, recordSample, validateProcessing };
+  processingRows, processingSteps, recordSample, stepRows, validateProcessing, validateStep };
