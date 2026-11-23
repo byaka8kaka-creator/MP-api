@@ -111,6 +111,7 @@ function metricsByBrand(row, lookups) {
   const totals = metricValues(row);
   const articles = lookups.articles.get(wbId(row.advertId));
   const brands = new Set(Array.from(articles ?? [], article => brandOf(lookups, article)));
+  if (brands.size <= 1) return [[brands.values().next().value ?? unknownBrand, totals]];
   const byBrand = new Map();
   const represented = metrics.map(() => 0);
   for (const day of arrayAt(row, 'days')) {
@@ -119,14 +120,12 @@ function metricsByBrand(row, lookups) {
         const article = wbId(item?.nmId);
         const brand = articles?.has(article) ? brandOf(lookups, article) : unknownBrand;
         const values = metricValues(item);
-        brands.add(brand);
         if (!byBrand.has(brand)) byBrand.set(brand, metrics.map(() => 0));
         addMetrics(byBrand.get(brand), values);
         addMetrics(represented, values);
       }
     }
   }
-  if (brands.size <= 1) return [[brands.values().next().value ?? unknownBrand, totals]];
   const reconciled = totals.every((total, index) => Math.abs(total - represented[index]) <=
     1e-7 + 32 * Number.EPSILON * Math.abs(total));
   if (byBrand.size && reconciled) return byBrand;

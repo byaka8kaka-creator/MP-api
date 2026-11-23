@@ -775,6 +775,11 @@ test('«Свод РК» объединяет три запроса и сумми
   const ids = [1, 2, 3, 4, 5];
   const metrics = multiplier => ({ views: multiplier * 10, clicks: multiplier * 2, atbs: multiplier * 3,
     orders: multiplier * 2, canceled: multiplier, sum: multiplier * 1.25, sum_price: multiplier * 10.5 });
+  const details = new Map([
+    [1, [{ nmId: 999, ...metrics(0), views: 1 }]],
+    [2, [{ nmId: 998, ...metrics(2) }]],
+    [3, [{ nmId: 11, ...metrics(2) }, { nmId: 20, ...metrics(3) }]],
+  ]);
   const fx = await fixture(t, request => {
     if (request.url.pathname === '/adv/v1/promotion/count') {
       return { body: JSON.stringify({ adverts: [{ status: 9, advert_list: ids.map(advertId => ({ advertId })) }] }) };
@@ -795,9 +800,7 @@ test('«Свод РК» объединяет три запроса и сумми
     const date = request.url.searchParams.get('beginDate');
     return { body: JSON.stringify(ids.map(advertId => ({
       advertId, currency: 'RUB', ...metrics(advertId === 3 ? 5 : advertId),
-      days: [{ date, views: advertId * 10, apps: advertId === 3 ? [
-        { appType: 64, nms: [{ nmId: 11, ...metrics(2) }, { nmId: 20, ...metrics(3) }] },
-      ] : [] }],
+      days: [{ date, views: advertId * 10, apps: [{ appType: 64, nms: details.get(advertId) ?? [] }] }],
     }))) };
   });
   const { store, service, user, requests } = fx;
@@ -856,6 +859,12 @@ test('«Свод РК» объединяет три запроса и сумми
     ['Бренд не определён', begin, end, ...Object.values(metrics(4))],
     ['Несколько брендов', begin, end, ...Object.values(metrics(5))],
   ]));
+  const requestCount = requests.length;
+  const exportedAgain = await exportRun(store, run, 'xlsx');
+  const reopened = new ExcelJS.Workbook();
+  await reopened.xlsx.readFile(path.join(exportedAgain, files.find(filename => filename.endsWith('.xlsx'))));
+  assert.deepEqual(reopened.getWorksheet('Свод РК').getSheetValues(), book.getWorksheet('Свод РК').getSheetValues());
+  assert.equal(requests.length, requestCount);
 });
 
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
