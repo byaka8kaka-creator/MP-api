@@ -464,6 +464,10 @@ function initialPosition(pagination) {
   return pagination.initial === undefined ? {} : { value: pagination.initial };
 }
 
+function parameterText(value, encoding) {
+  return Array.isArray(value) && encoding === 'csv' ? value.map(scalarText).join(',') : scalarText(value);
+}
+
 function requestFor(source, values, position, credentials = null) {
   const { template, environment } = source;
   const { endpoint, profile } = profileFor(source);
@@ -480,12 +484,11 @@ function requestFor(source, values, position, credentials = null) {
       if (Array.isArray(value) && encoding === 'repeat') {
         for (const item of value) query.append(key, scalarText(item));
       } else {
-        const encoded = Array.isArray(value) && encoding === 'csv' ? value.map(scalarText).join(',') : scalarText(value);
-        query.set(key, value === null ? 'null' : encoded);
+        query.set(key, value === null ? 'null' : parameterText(value, encoding));
       }
     }
     if (where === 'path') {
-      const encoded = scalarText(value);
+      const encoded = parameterText(value, encoding);
       demand(encoded && encoded !== '.' && encoded !== '..', 'Недопустимое значение параметра пути.');
       relative = relative.replaceAll(`{${key}}`, encodeURIComponent(encoded));
     }
@@ -651,4 +654,4 @@ function historyWarning(template, values, now = new Date()) {
 }
 
 module.exports = { batches, clone, columns, dateMs, demand, folder, historyWarning, id, initialPosition, inputValues, methods,
-  nextPosition, positive, profileFor, requestFor, responseRows, text, validateConnection, validateTemplate };
+  nextPosition, parameterText, positive, profileFor, requestFor, responseRows, text, validateConnection, validateTemplate };

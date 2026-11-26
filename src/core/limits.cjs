@@ -1,6 +1,6 @@
 const { createHash } = require('node:crypto');
 const { setTimeout: sleep } = require('node:timers/promises');
-const { scalarText } = require('./json.cjs');
+const { parameterText } = require('./model.cjs');
 
 function retryAfter(value, now) {
   if (!value) return null;
@@ -30,9 +30,11 @@ class LimitScheduler {
     for (const rule of rules) {
       if (rule.environment && rule.environment !== environment) continue;
       const scope = rule.scopeParam?.find(name => values[name] !== undefined && values[name] !== null);
+      const pathParameter = scope && template.parameters?.find(parameter => parameter.name === scope && parameter.where === 'path');
+      const scopeValue = scope && parameterText(values[scope], pathParameter?.encoding);
       const credential = rule.credential && credentials[rule.credential];
       const identity = credential ? createHash('sha256').update(credential).digest('hex') : connection.account;
-      const key = JSON.stringify([connection.policyId, environment, rule.id, rule.type, identity, scope, scope && scalarText(values[scope])]);
+      const key = JSON.stringify([connection.policyId, environment, rule.id, rule.type, identity, scope, scopeValue]);
       let state = this.states.get(key);
       if (!state) {
         state = { tokens: rule.burst, time: this.now(), requests: [], running: 0, paused: 0, remaining: null, reserved: 0, until: 0 };

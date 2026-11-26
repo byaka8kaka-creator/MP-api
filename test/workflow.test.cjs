@@ -961,6 +961,63 @@ test('обработка всей выгрузки соединяет сохра
   assert.equal(fx.requests.length, 2);
 });
 
+test('отгрузки Маркета получают список магазинов и подставляют по одному ID в путь каждой страницы', async t => {
+  const largeId = '9223372036854775807';
+  let shops = [41, parseJson(largeId), 41];
+  const listPath = '/v2/campaigns';
+  const shipmentPath = campaignId => `/v2/campaigns/${campaignId}/first-mile/shipments`;
+  const fx = await fixture(t, ({ url }) => {
+    if (url.pathname === listPath) return { body: stringify({ campaigns: shops.map(id => ({ id })) }) };
+    const token = url.searchParams.get('pageToken');
+    const next = url.pathname === shipmentPath(41) && !token ? 'page + 2' : undefined;
+    return { body: stringify({ status: 'OK', result: { shipments: [{ status: 'CREATED' }], paging: { nextPageToken: next } } }) };
+  });
+  const { store, service, user, requests } = fx;
+  const manual = service.source(user, { templateId: 'yandex-shipments', values: { campaignId: 41 } });
+  const { id: ignored, ...definition } = manual.template;
+  const { connectionId, endpointId } = definition;
+  const listId = service.saveDraft(user, stringify({ connectionId, endpointId, name: 'Магазины Маркета',
+    method: 'GET', path: listPath, response: { rows: 'campaigns' }, available: true }));
+  service.publish(user, listId);
+  const shipmentsId = service.saveDraft(user, stringify({ ...definition, name: 'Отгрузки всех магазинов',
+    parameters: [{ name: 'campaignId', label: 'ID магазинов', where: 'path', type: 'array',
+      items: { type: 'integer', min: 1 }, batchSize: 1, encoding: 'csv', minItems: 1,
+      reference: { templateId: listId, mode: 'all', refresh: 'run', path: 'id' },
+    }, ...definition.parameters.slice(1)],
+    response: { ...definition.response, requestFields: { campaignId: 'campaignId.0' },
+      columns: [{ path: 'request.campaignId', name: 'ID магазина' }] },
+  }));
+  service.publish(user, shipmentsId);
+  const jobId = service.saveJob(user, { name: 'Магазины', format: 'csv', entries: [{ templateId: shipmentsId,
+    values: { dateFrom: '2026-11-25', dateTo: '2026-11-25' } }] });
+
+  const runId = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(runId);
+  const run = store.run(runId);
+  assert.equal(run.state, 'completed');
+  assert.equal(run.progress.exportError, undefined);
+  assert.deepEqual(requests.map(({ method, url }) => [method, url.pathname, url.searchParams.get('pageToken')]), [
+    ['GET', listPath, null], ['PUT', shipmentPath(41), null], ['PUT', shipmentPath(41), 'page + 2'], ['PUT', shipmentPath(largeId), null],
+  ]);
+  for (const request of requests.slice(1)) {
+    assert.deepEqual(JSON.parse(request.body), { dateFrom: '2026-11-25', dateTo: '2026-11-25' });
+  }
+  const csv = await fs.readFile(path.join(run.progress.exportPath, '01-Отгрузки всех магазинов.csv'), 'utf8');
+  assert.deepEqual(csv.trim().split('\r\n'), ['ID магазина', '41', '41', largeId]);
+
+  const limiter = new LimitScheduler();
+  const manualLimits = limiter.entries(manual, { campaignId: 41 }, {});
+  const automaticLimits = limiter.entries(run.snapshot.sources[0], { campaignId: [41] }, {});
+  assert.equal(manualLimits.length, 3);
+  for (const [index, entry] of manualLimits.entries()) assert.equal(entry.state, automaticLimits[index].state);
+
+  shops = [52];
+  const another = service.createRun(user, { kind: 'job', jobId });
+  await fx.run(another);
+  assert.equal(store.run(another).state, 'completed');
+  assert.deepEqual(requests.slice(4).map(request => request.url.pathname), [listPath, shipmentPath(52)]);
+});
+
 test('пустая цепочка пропускает HTTP-запросы, а частичная загрузка кампаний блокирует статистику', async t => {
   let mode = 'empty';
   const countPath = '/adv/v1/promotion/count';
