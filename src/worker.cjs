@@ -3,12 +3,14 @@ const { Store } = require('./core/store.cjs');
 const { LimitScheduler } = require('./core/limits.cjs');
 const { executeRun, problem } = require('./core/runner.cjs');
 const { exportRun, previewProcessing, prune } = require('./core/datasets.cjs');
-const { parseJson } = require('./core/json.cjs');
+const { InputError, parseJson } = require('./core/json.cjs');
+const { ProcessingFieldLists } = require('./core/processing-fields.cjs');
 
 const root = process.argv.at(-1);
 const port = process.parentPort;
 const store = new Store(root, { seed: false });
 const limiter = new LimitScheduler();
+const fieldLists = new ProcessingFieldLists(store);
 const active = new Map();
 const fetcher = (url, options) => net.fetch(url.href, options);
 
@@ -20,6 +22,16 @@ port.on('message', async ({ data }) => {
   }
   if (action === 'prune') {
     await prune(store).catch(() => port.postMessage({ event: 'maintenance-error' }));
+    return;
+  }
+  if (action === 'processingFields') {
+    try {
+      const value = await fieldLists.choices(data.fieldContext);
+      port.postMessage({ event: 'result', requestId, value });
+    } catch (error) {
+      port.postMessage({ event: 'result', requestId,
+        error: error instanceof InputError ? error.message : 'Не удалось прочитать поля сохранённого образца.' });
+    }
     return;
   }
   if (action === 'export' || action === 'processingPreview') {

@@ -36,29 +36,32 @@ function processingList(items, make, blank, addLabel, chooser) {
   return {
     node: stack(list, h('div', { class: 'recipe-add' }, chooser, btn(addLabel, () => append([blank()]), 'compact'))),
     append,
-    value: () => rows.map(row => row.value()),
+    value: ({ before, fieldsOnly } = {}) => (before ? rows.slice(0, rows.indexOf(before)) : rows).map(row => row.value(fieldsOnly)),
   };
 }
 
-function editProcessingStep(step, open = false, workbook) {
+function editProcessingStep(step, open, loadFields, workbook) {
   const isRowStep = step && Object.hasOwn(stepNames, step.type);
   if (!isRowStep && (!workbook || !step || !Object.hasOwn(workbook.names, step.type))) {
     throw new Error('Укажите поддерживаемый тип шага.');
   }
   const onError = select([['stop', 'Остановить обработку'], ['skip', 'Пропустить запись']], step.onError ?? 'stop');
-  const controls = isRowStep ? stepControls(step) : workbook.controls(step);
   const names = workbook?.datasets(step);
+  const lookup = (selection = {}, alias = names?.from.value) => loadFields(row, selection, alias);
+  const controls = isRowStep ? stepControls(step, lookup) : workbook.controls(step, lookup);
   const summary = h('summary');
-  return {
+  const row = {
     title: isRowStep ? stepNames[step.type] : workbook.names[step.type],
     summary,
     summarySuffix: names?.suffix,
     node: h('details', { open }, summary, stack(names?.node, controls.node, field('При ошибке', onError))),
-    value: () => ({ type: step.type, ...names?.value(), ...controls.value(), onError: onError.value }),
+    value: fieldsOnly => ({ type: step.type, ...names?.value(), ...controls.value(fieldsOnly), onError: onError.value }),
   };
+  return row;
 }
 
-function stepControls(step) {
+function stepControls(step, lookup) {
+  const pick = (label, control) => processingPathField(label, control, () => lookup());
   switch (step.type) {
     case 'filter': {
       const path = input(step.path ?? '', { placeholder: 'dailyStats' });
@@ -69,9 +72,9 @@ function stepControls(step) {
       const comparison = field('Значение (JSON)', target);
       comparison.hidden = !compare();
       operator.addEventListener('change', () => { comparison.hidden = !compare(); });
-      return { node: stack(fields(field('Путь к полю', path), field('Условие', operator)), comparison),
-        value: () => ({ path: path.value, operator: operator.value,
-          ...(compare() ? { value: editedJson(target.value, 'Значение для сравнения') } : {}) }) };
+      return { node: stack(fields(pick('Путь к полю', path), field('Условие', operator)), comparison),
+        value: fieldsOnly => ({ path: path.value, operator: operator.value,
+          ...(!fieldsOnly && compare() ? { value: editedJson(target.value, 'Значение для сравнения') } : {}) }) };
     }
     case 'validate': {
       const checks = processingList(step.checks ?? [{}], check => {
@@ -79,10 +82,10 @@ function stepControls(step) {
         const kind = select([['present', 'Поле присутствует'], ['object', 'Объект'], ['array', 'Массив'],
           ['date', 'Дата YYYY-MM-DD'], ['dateInterval', 'Начало периода не позже конца']], check.kind ?? 'present');
         const endPath = input(check.endPath ?? '', { placeholder: 'statistic.period.end' });
-        const end = field('Путь к концу периода', endPath);
+        const end = pick('Путь к концу периода', endPath);
         end.hidden = kind.value !== 'dateInterval';
         kind.addEventListener('change', () => { end.hidden = kind.value !== 'dateInterval'; });
-        return { node: stack(fields(field('Путь к полю', path), field('Проверка', kind)), end),
+        return { node: stack(fields(pick('Путь к полю', path), field('Проверка', kind)), end),
           value: () => ({ path: path.value, kind: kind.value,
             ...(kind.value === 'dateInterval' ? { endPath: endPath.value } : {}) }) };
       }, () => ({}), 'Добавить проверку');
@@ -92,7 +95,8 @@ function stepControls(step) {
       const path = input(step.path ?? '', { placeholder: 'dailyStats' });
       const as = input(step.as ?? 'item');
       const keepEmpty = checkbox('Сохранять строку при пустом массиве', step.keepEmpty);
-      return { node: stack(fields(field('Путь к массиву', path), field('Имя поля для элемента', as)), keepEmpty.label),
+      const chooseArray = processingPathField('Путь к массиву', path, () => lookup({ kind: 'array' }));
+      return { node: stack(fields(chooseArray, field('Имя поля для элемента', as)), keepEmpty.label),
         value: () => ({ path: path.value, as: as.value, keepEmpty: keepEmpty.control.checked }) };
     }
     case 'expandObjects': {
@@ -103,8 +107,10 @@ function stepControls(step) {
         const label = input(variant.label ?? '');
         const optional = checkbox('Пропустить отсутствующий объект', variant.optional);
         const ifPresent = input(variant.ifPresent ?? '', { placeholder: 'period' });
-        return { node: stack(fields(field('Путь к объекту', path), field('Подпись', label)),
-          optional.label, field('Создать строку, если внутри объекта есть поле', ifPresent)),
+        const chooseObject = processingPathField('Путь к объекту', path, () => lookup({ kind: 'object' }));
+        const chooseMember = processingPathField('Создать строку, если внутри объекта есть поле', ifPresent,
+          () => lookup({ kind: 'member', path: path.value }));
+        return { node: stack(fields(chooseObject, field('Подпись', label)), optional.label, chooseMember),
         value: () => ({ path: path.value, label: label.value, optional: optional.control.checked, ifPresent: ifPresent.value }) };
       }, () => ({}), 'Добавить объект');
       return { node: stack(fields(field('Имя поля для объекта', as), field('Имя поля для подписи', labelAs)), variants.node),
@@ -115,7 +121,7 @@ function stepControls(step) {
         const from = input(item.from ?? '', { placeholder: 'day.stat' });
         const to = input(item.to ?? '', { placeholder: 'stat' });
         const trim = checkbox('Убрать пробелы по краям текста', item.trim);
-        return { node: stack(fields(field('Откуда взять значение', from), field('Имя выходного поля', to)), trim.label),
+        return { node: stack(fields(pick('Откуда взять значение', from), field('Имя выходного поля', to)), trim.label),
           value: () => ({ from: from.value, to: to.value, ...(trim.control.checked ? { trim: true } : {}) }) };
       }, () => ({}), 'Добавить поле');
       const keepOriginal = checkbox('Сохранить остальные поля строки', step.keepOriginal);
@@ -125,20 +131,23 @@ function stepControls(step) {
   }
 }
 
-function processingColumns(items) {
+function processingColumns(items, loadFields) {
   return processingList(items, item => {
     const path = input(item.path, { placeholder: 'stat.normQuery' });
     const name = input(item.name);
-    return { node: fields(field('Путь к полю', path), field('Название колонки', name)),
+    return { node: fields(processingPathField('Путь к полю', path, loadFields), field('Название колонки', name)),
       value: () => ({ path: path.value, name: name.value }) };
   }, () => ({ path: '$', name: '' }), 'Добавить колонку');
 }
 
-function processingBuilder(recipe) {
+function processingBuilder(recipe, templateId) {
+  const load = (before, selection) => call('processingFields', {
+    templateId, steps: steps.value({ before, fieldsOnly: true }), selection,
+  });
   const stepType = select(Object.entries(stepNames));
-  const steps = processingList(recipe.steps, editProcessingStep, () => ({ type: stepType.value }),
+  const steps = processingList(recipe.steps, (step, open) => editProcessingStep(step, open, load), () => ({ type: stepType.value }),
     'Добавить шаг', field('Новый шаг', stepType));
-  const columns = processingColumns(recipe.columns);
+  const columns = processingColumns(recipe.columns, () => load(undefined, { kind: 'column' }));
   return {
     node: stack(h('h3', {}, 'Шаги обработки'), steps.node,
       h('details', { class: 'fold recipe-columns' }, h('summary', {}, 'Колонки результата'), columns.node)),
@@ -179,7 +188,7 @@ function processingEditor(saved) {
   let builder;
   let mode = 'steps';
   const useSteps = value => {
-    builder = isWorkbook() ? workbookBuilder(value, choices) : processingBuilder(value);
+    builder = isWorkbook() ? workbookBuilder(value, choices) : processingBuilder(value, template.value);
     mode = 'steps';
     pane.replaceChildren(builder.node);
   };

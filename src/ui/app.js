@@ -68,12 +68,17 @@ function input(value = '', attrs = {}) {
   return h('input', { value, ...attrs });
 }
 
-function field(label, control, hint) {
+function field(label, control, hint, action) {
   const key = `field-${++fieldCount}`;
   control.setAttribute('aria-labelledby', key);
   if (hint) control.setAttribute('aria-describedby', `${key}-hint`);
-  return h('label', { class: 'field' }, h('span', { id: key }, label), control,
-    hint && h('small', { class: 'caption', id: `${key}-hint` }, hint));
+  const description = hint && h('small', { class: 'caption', id: `${key}-hint` }, hint);
+  if (action) {
+    control.id = `${key}-input`;
+    return h('div', { class: 'field' }, h('label', { id: key, for: control.id }, label),
+      h('div', { class: 'field-action' }, control, action), description);
+  }
+  return h('label', { class: 'field' }, h('span', { id: key }, label), control, description);
 }
 
 function checkbox(label, checked = false) {

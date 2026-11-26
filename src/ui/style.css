@@ -156,7 +156,27 @@ dialog::backdrop { background: #14282080; }
 form { margin: 0; }
 .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; align-items: start; }
 .field { display: grid; gap: 5px; min-width: 0; color: #2d4034; }
-.field > span { font-weight: 620; font-size: 13px; }
+.field > span, .field > label { font-weight: 620; font-size: 13px; }
+.field-action { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; }
+.field-action .button { white-space: nowrap; }
+.field-picker { width: min(620px, calc(100vw - 44px)); }
+.field-picker .caption:empty, .field-options:empty { display: none; }
+.field-options { display: grid; gap: 5px; max-height: min(47vh, 420px); overflow: auto; padding: 4px; }
+.field-option {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  text-align: left;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: white;
+  color: var(--ink);
+  padding: 8px 10px;
+  cursor: pointer;
+}
+.field-option:hover { background: var(--primary-soft); }
+.field-option .caption { flex-shrink: 0; }
 input:not([type='checkbox']), select, textarea {
   background: white;
   color: var(--ink);

@@ -42,14 +42,18 @@ async function saveSample(store, runId, source, raw) {
   await writeAtomic(path.join(resultDir(store, runId, source), 'sample.json'), raw);
 }
 
-async function sample(store, runId, source) {
-  let raw;
+async function readSample(store, runId, source) {
   try {
-    raw = await fs.readFile(path.join(resultDir(store, runId, source), 'sample.json'), 'utf8');
+    return await fs.readFile(path.join(resultDir(store, runId, source), 'sample.json'), 'utf8');
   } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw error;
   }
+}
+
+async function sample(store, runId, source) {
+  const raw = await readSample(store, runId, source);
+  if (raw === null) return null;
   return {
     shape: inferShape(parseJson(raw)),
     text: raw.length <= 25_000 ? raw : raw.slice(0, 25_000),
@@ -469,5 +473,5 @@ async function prune(store, now = Date.now()) {
   }
 }
 
-module.exports = { exportRun, generalLog, logEvent, logTail, pageFile, preview, previewProcessing, prune, records,
+module.exports = { exportRun, generalLog, logEvent, logTail, pageFile, preview, previewProcessing, prune, readSample, records,
   referenceValues, runLog, sample, saveSample, writePage };

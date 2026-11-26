@@ -11,12 +11,15 @@ const groupOperations = [['sum', 'Сумма'], ['count', 'Количество 
   ['min', 'Минимум'], ['max', 'Максимум']];
 
 function workbookFields(value, definitions) {
-  const entries = definitions.map(([key, label, placeholder]) => [key, label, input(value[key] ?? '', { placeholder })]);
-  return { node: fields(entries.map(([, label, control]) => field(label, control))),
-    value: () => Object.fromEntries(entries.map(([key, , control]) => [key, control.value])) };
+  const controls = Object.fromEntries(definitions.map(([key, , placeholder]) => [key, input(value[key] ?? '', { placeholder })]));
+  return { node: fields(definitions.map(([key, label, , load]) => load
+    ? processingPathField(label, controls[key], () => load(controls)) : field(label, controls[key]))),
+    inputs: controls,
+    value: () => Object.fromEntries(Object.entries(controls).map(([key, control]) => [key, control.value])) };
 }
 
-function workbookStepControls(step, dataset) {
+function workbookStepControls(step, dataset, lookup) {
+  const pick = (label, control, hint) => processingPathField(label, control, () => lookup(), hint);
   switch (step.type) {
     case 'join': {
       const right = dataset(step.right);
@@ -25,7 +28,8 @@ function workbookStepControls(step, dataset) {
         ['first', 'Взять первое совпадение'], ['unique', 'Взять одно, если совпадения одинаковые']], step.matches ?? 'list');
       const missing = select([['keep', 'Оставить строку'], ['drop', 'Убрать строку'], ['error', 'Считать ошибкой']], step.missing ?? 'keep');
       const keys = processingList(step.keys ?? [{}], key => {
-        const paths = workbookFields(key, [['left', 'Ключ во входном наборе', 'advertId'], ['right', 'Ключ в справочнике', 'advertId']]);
+        const paths = workbookFields(key, [['left', 'Ключ во входном наборе', 'advertId', () => lookup()],
+          ['right', 'Ключ в справочнике', 'advertId', () => lookup({}, right.value)]]);
         const type = select(keyTypes, key.type ?? 'exact');
         return { node: stack(paths.node, field('Сравнение ключей', type)), value: () => ({ ...paths.value(), type: type.value }) };
       }, () => ({}), 'Добавить ключ');
@@ -34,8 +38,9 @@ function workbookStepControls(step, dataset) {
       value: () => ({ right: right.value, keys: keys.value(), as: as.value, matches: matches.value, missing: missing.value }) };
     }
     case 'collect': {
-      const controls = workbookFields({ as: 'list', separator: ', ', ...step }, [['path', 'Путь к массиву', 'items'],
-        ['value', 'Путь к значению внутри элемента', 'item.nmId'], ['as', 'Имя выходного поля'], ['separator', 'Разделитель'],
+      const controls = workbookFields({ as: 'list', separator: ', ', ...step }, [['path', 'Путь к массиву', 'items', () => lookup({ kind: 'array' })],
+        ['value', 'Путь к значению внутри элемента', 'item.nmId', fields => lookup({ kind: 'item', path: fields.path.value })],
+        ['as', 'Имя выходного поля'], ['separator', 'Разделитель'],
         ['missing', 'Подпись для пустого значения']]);
       const unique = checkbox('Оставить только разные значения', step.unique !== false);
       return { node: stack(controls.node, unique.label), value: () => ({ ...controls.value(), unique: unique.control.checked }) };
@@ -44,34 +49,39 @@ function workbookStepControls(step, dataset) {
       const keys = processingList(step.keys ?? [{}], key => {
         const path = input(key.path ?? '', { placeholder: 'advertId' });
         const type = select(keyTypes, key.type ?? 'exact');
-        return { node: fields(field('Путь к полю', path), field('Сравнение ключей', type)),
+        return { node: fields(pick('Путь к полю', path), field('Сравнение ключей', type)),
           value: () => ({ path: path.value, type: type.value }) };
       }, () => ({}), 'Добавить ключ');
       return { node: keys.node, value: () => ({ keys: keys.value() }) };
     }
     case 'allocate': {
+      const itemFields = fields => lookup({ kind: 'item', path: fields.items.value });
       const controls = workbookFields({ as: 'allocated', unknown: 'Группа не определена', mixed: 'Несколько групп', ...step }, [
-        ['items', 'Путь к массиву объектов', 'items'], ['itemKey', 'Ключ объекта', 'item.nmId'],
-        ['label', 'Поле с группой объекта', 'product.brand'], ['details', 'Путь к детализации показателей', 'days.apps.nms'],
-        ['detailKey', 'Ключ в детализации', 'nmId'], ['as', 'Имя поля с результатом'],
+        ['items', 'Путь к массиву объектов', 'items', () => lookup({ kind: 'array' })], ['itemKey', 'Ключ объекта', 'item.nmId', itemFields],
+        ['label', 'Поле с группой объекта', 'product.brand', itemFields],
+        ['details', 'Путь к детализации показателей', 'days.apps.nms', () => lookup({ kind: 'details' })],
+        ['detailKey', 'Ключ в детализации', 'nmId', fields => lookup({ kind: 'detail', path: fields.details.value })],
+        ['as', 'Имя поля с результатом'],
         ['unknown', 'Подпись при неизвестной группе'], ['mixed', 'Подпись при нескольких группах'],
       ]);
       const multiple = select([['reconcile', 'Распределить, если детализация сходится с итогом'],
         ['combine', 'Отнести всю сумму в общую группу']], step.multiple ?? 'reconcile');
       const metrics = processingList(step.metrics ?? [{}], metric => workbookFields(metric, [
-        ['total', 'Поле с общим показателем', 'views'], ['detail', 'Поле показателя в детализации', 'views'], ['name', 'Имя показателя результата'],
+        ['total', 'Поле с общим показателем', 'views', () => lookup()],
+        ['detail', 'Поле показателя в детализации', 'views', () => lookup({ kind: 'detail', path: controls.inputs.details.value })],
+        ['name', 'Имя показателя результата'],
       ]), () => ({}), 'Добавить показатель');
       return { node: stack(controls.node, field('Если групп несколько', multiple), metrics.node),
         value: () => ({ ...controls.value(), multiple: multiple.value, metrics: metrics.value() }) };
     }
     case 'group': {
-      const keys = processingList(step.keys ?? [], key => workbookFields(key, [['path', 'Путь к полю', 'brand'], ['name', 'Имя поля результата']]),
+      const keys = processingList(step.keys ?? [], key => workbookFields(key, [['path', 'Путь к полю', 'brand', () => lookup()], ['name', 'Имя поля результата']]),
         () => ({}), 'Добавить поле группировки');
       const metrics = processingList(step.metrics ?? [{}], metric => {
         const op = select(groupOperations, metric.op ?? 'sum');
         const path = input(metric.path ?? '', { placeholder: 'allocated.views' });
         const name = input(metric.name ?? '');
-        const pathField = field('Путь к показателю', path);
+        const pathField = pick('Путь к показателю', path);
         const displayPath = () => { pathField.hidden = op.value === 'count'; };
         displayPath();
         op.addEventListener('change', displayPath);
@@ -80,7 +90,7 @@ function workbookStepControls(step, dataset) {
       }, () => ({}), 'Добавить показатель');
       const uniform = input(step.uniform ?? '', { placeholder: 'currency' });
       return { node: stack(h('strong', {}, 'Группировать по'), keys.node, h('strong', {}, 'Рассчитать'), metrics.node,
-        field('Поле, значение которого должно совпадать во всех строках', uniform, 'Например, валюта. Оставьте пустым, если проверка не нужна.')),
+        pick('Поле, значение которого должно совпадать во всех строках', uniform, 'Например, валюта. Оставьте пустым, если проверка не нужна.')),
       value: () => ({ keys: keys.value(), metrics: metrics.value(), ...(uniform.value ? { uniform: uniform.value } : {}) }) };
     }
   }
@@ -91,6 +101,9 @@ function workbookBuilder(recipe, choices) {
   const dataset = value => input(value, { list: datasetOptions.id, placeholder: 'source1' });
   const datasetName = (value = '') => input(value, { 'data-dataset-name': '', placeholder: 'brandMetrics' });
   const choicesList = choices.map(item => [item.id, [item.connection, item.folder, item.name].filter(Boolean).join(' · ')]);
+  const load = (before, selection, alias) => call('processingFields', {
+    sources: sources.value(), steps: steps.value({ before, fieldsOnly: true }), selection, alias,
+  });
 
   const sheets = processingList(recipe.sheets, (sheet, open) => {
     const name = input(sheet.name);
@@ -98,11 +111,13 @@ function workbookBuilder(recipe, choices) {
     const expand = checkbox('Развернуть массив на листе', sheet.expand !== undefined);
     const path = input(sheet.expand ?? '', { placeholder: 'days' });
     const separate = checkbox('Использовать поля элемента и $parent для исходной строки', sheet.separate);
-    const expansion = stack(field('Путь к массиву', path, 'Для массива в корне оставьте пустым или укажите $.'), separate.label);
+    const expansion = stack(processingPathField('Путь к массиву', path, () => load(undefined, { kind: 'array' }, from.value),
+      'Для массива в корне оставьте пустым или укажите $.'), separate.label);
     const displayExpansion = () => { expansion.hidden = !expand.control.checked; };
     displayExpansion();
     expand.control.addEventListener('change', displayExpansion);
-    const columns = processingColumns(sheet.columns ?? []);
+    const columns = processingColumns(sheet.columns ?? [], () => load(undefined,
+      { kind: 'column', path: expand.control.checked ? path.value : undefined }, from.value));
     const summary = h('summary');
     const suffix = h('span', { class: 'caption recipe-output' }, name.value);
     name.addEventListener('input', () => { suffix.textContent = name.value; });
@@ -141,17 +156,17 @@ function workbookBuilder(recipe, choices) {
   const stepType = select(Object.entries({ ...stepNames, ...workbookStepNames }));
   const workbook = {
     names: workbookStepNames,
-    controls: step => workbookStepControls(step, dataset),
+    controls: (step, lookup) => workbookStepControls(step, dataset, lookup),
     datasets: step => {
       const from = dataset(step.input);
       const output = datasetName(step.output);
       const suffix = h('span', { class: 'caption recipe-output' }, output.value);
       output.addEventListener('input', () => { suffix.textContent = output.value; });
-      return { node: fields(field('Набор на входе', from), field('Имя результата', output)), suffix,
+      return { node: fields(field('Набор на входе', from), field('Имя результата', output)), suffix, from,
         value: () => ({ input: from.value, output: output.value }) };
     },
   };
-  const steps = processingList(recipe.steps, (step, open) => editProcessingStep(step, open, workbook), () => ({ type: stepType.value }),
+  const steps = processingList(recipe.steps, (step, open) => editProcessingStep(step, open, load, workbook), () => ({ type: stepType.value }),
     'Добавить шаг', field('Новый шаг', stepType));
   const node = stack(h('details', { class: 'fold', open: true }, h('summary', {}, 'Источники обработки'), sources.node),
     h('details', { class: 'fold' }, h('summary', {}, 'Шаги обработки'), steps.node), sheetsFold, datasetOptions);

@@ -255,6 +255,9 @@ async function actions(action, value) {
       return service.deleteProcessing(user, value.processingId);
     case 'processingRuns':
       return service.processingRuns(user, value.templateId, value.sourcesJson === undefined ? undefined : readJson(value.sourcesJson, 'Источники'));
+    case 'processingFields':
+      demand(user.role !== 'user', 'Выбор полей доступен настройщику.');
+      return requestWorker('processingFields', { fieldContext: value });
     case 'processingPreview': {
       const { runId, sourceIndex, processing } = service.processingPreview(user, {
         ...readJson(value.json, 'Обработка'), runId: value.runId, source: value.source,

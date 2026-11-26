@@ -9,6 +9,7 @@ const { exportRun, logTail, previewProcessing, runLog, sample, writePage } = req
 const { parseJson, stringify } = require('../src/core/json.cjs');
 const { LimitScheduler } = require('../src/core/limits.cjs');
 const { batches, inputValues, requestFor, validateConnection, validateTemplate } = require('../src/core/model.cjs');
+const { ProcessingFieldLists } = require('../src/core/processing-fields.cjs');
 const { CLUSTERS_COLUMNS, FUNNEL_COLUMNS, FUNNEL_PATH } = require('../src/core/processings.cjs');
 const { executeRun } = require('../src/core/runner.cjs');
 const { DEFER_MS, scheduleDecision } = require('../src/core/schedule.cjs');
@@ -1136,6 +1137,90 @@ test('редактируемые шаги показывают счётчики,
   assert.match(stopped.error, /Шаг 3/);
   assert.throws(() => service.saveProcessing(user, { ...config, steps: [{ type: 'validate', checks: [] }] }), /Шаг 1/);
   assert.equal(fx.requests.length, 1);
+});
+
+test('выбор полей по образцу учитывает вложенные записи, входы шагов и выходные колонки', async t => {
+  let postings = [
+    { posting_number: 'fixture-posting', products: [{ sku: 11 }, { sku: 12, offer_id: 'AB-12' }] },
+    { posting_number: 'other-posting', optional: { lateField: true }, products: [] },
+  ];
+  const fx = await fixture(t, request => ({ body: stringify(request.url.pathname === '/v4/posting/fbs/list'
+    ? { has_next: false, cursor: '', postings }
+    : { data: { products: [{ product: { nmId: 11, brandName: 'Альфа' }, statistic: {
+      selected: { openCount: 5, breakdown: [{ platforms: [{ code: 'app', views: 5 }] }] }, past: { orderSum: 20 },
+    } }] } }) }));
+  const { service, store, user } = fx;
+  const postingTemplate = { name: 'Отправления Ozon', path: '/v4/posting/fbs/list', method: 'POST', connectionId: 'ozon', endpointId: 'seller',
+    parameters: [{ name: 'since', where: 'body', type: 'datetime', default: '2026-11-24T21:00:00Z' }],
+    response: { rows: 'postings' } };
+  function publish(template) {
+    const templateId = service.saveDraft(user, stringify(template));
+    service.publish(user, templateId);
+    return templateId;
+  }
+  const ozon = publish(postingTemplate);
+  const wb = publish({ name: 'Воронка WB', path: FUNNEL_PATH, method: 'POST', connectionId: 'wildberries', endpointId: 'analytics',
+    response: { rows: 'data.products' } });
+  service.credentialSettings(user, { connectionId: 'wildberries', endpointId: 'analytics', profileId: 'default',
+    environment: 'production', values: { token: 'fixture-token' } }, true);
+  const fields = new ProcessingFieldLists(store);
+  const pick = async context => (await fields.choices(context)).choices;
+  const paths = choices => choices.map(choice => choice.path);
+  async function testTemplate(templateId) {
+    const runId = service.createRun(user, { kind: 'test', entry: { templateId } });
+    await fx.run(runId);
+    const run = store.run(runId);
+    assert.equal(run.state, 'completed', run.progress.sources[0]?.error);
+  }
+  const noSample = await fields.choices({ templateId: ozon });
+  assert.deepEqual(noSample.choices, []);
+  assert.match(noSample.notices[0], /тест шаблона/);
+  await testTemplate(ozon);
+  await testTemplate(wb);
+
+  const rows = await pick({ templateId: ozon });
+  assert.deepEqual(paths(rows), ['$', 'posting_number', 'products', 'optional', 'optional.lateField']);
+  assert.equal(JSON.stringify(rows).includes('fixture-posting'), false);
+  assert.deepEqual(rows.find(item => item.path === 'products').types, ['array']);
+  const expanded = { type: 'expandArray', input: 'postings', output: 'expanded', path: 'products', as: 'item' };
+  assert.ok(paths(await pick({ templateId: ozon, steps: [expanded] })).includes('item.offer_id'));
+  const sheet = { kind: 'column', path: 'products' };
+  const sheetPaths = paths(await pick({ templateId: ozon, selection: sheet }));
+  assert.ok(sheetPaths.includes('$item.offer_id'));
+  assert.ok(sheetPaths.includes('$parent.posting_number'));
+  assert.ok(paths(await pick({ templateId: ozon, selection: { kind: 'item', path: 'products' } })).includes('offer_id'));
+
+  const sources = [{ alias: 'postings', templateId: ozon, requestFields: [{ path: 'since', name: 'begin' }] }, { alias: 'funnel', templateId: wb }];
+  const join = { type: 'join', input: 'expanded', right: 'funnel', output: 'joined', as: 'campaign', matches: 'first' };
+  const periods = { type: 'expandObjects', input: 'joined', output: 'periods', as: 'statistic', labelAs: 'periodType', variants: [
+    { path: 'campaign.statistic.selected' }, { path: 'campaign.statistic.past' },
+  ] };
+  const grouped = { type: 'group', input: 'periods', output: 'summary', keys: [{ name: 'brand', path: 'campaign.product.brandName' }],
+    metrics: [{ name: 'opens', op: 'sum', path: 'statistic.openCount' }] };
+  const steps = [expanded, join, periods, grouped];
+  assert.ok(paths(await pick({ sources, steps: [expanded], alias: 'expanded' })).includes('request.begin'));
+  assert.deepEqual(paths(await pick({ sources, steps: [expanded], alias: 'funnel' })), paths(await pick({ templateId: wb })));
+  const periodPaths = paths(await pick({ sources, steps, alias: 'periods' }));
+  assert.ok(periodPaths.includes('statistic.openCount'));
+  assert.ok(periodPaths.includes('statistic.orderSum'));
+  assert.ok(periodPaths.includes('periodType'));
+  assert.deepEqual(await pick({ sources, steps, alias: 'summary', selection: { kind: 'column' } }), [
+    { path: '$', types: ['object'] }, { path: 'brand', types: ['string'] }, { path: 'opens', types: ['number'] },
+  ]);
+  const nestedPath = 'statistic.selected.breakdown.platforms';
+  assert.ok(paths(await pick({ templateId: wb, selection: { kind: 'details' } })).includes(nestedPath));
+  assert.deepEqual(paths(await pick({ templateId: wb, selection: { kind: 'detail', path: nestedPath } })), ['$', 'code', 'views']);
+  publish({ ...store.template(wb).published, response: { rows: 'data.products.0', singleObject: true } });
+  assert.ok(paths(await pick({ templateId: wb })).includes('product.brandName'));
+  assert.equal(fx.requests.length, 2);
+
+  postings = [{ latest: true }];
+  await testTemplate(ozon);
+  assert.deepEqual(paths(await pick({ templateId: ozon })), ['$', 'latest']);
+  publish({ ...postingTemplate, id: ozon, response: { rows: 'missing' } });
+  assert.match((await fields.choices({ templateId: ozon })).notices[0], /путь к строкам/);
+  publish({ ...postingTemplate, id: ozon, path: '/new-endpoint' });
+  assert.match((await fields.choices({ templateId: ozon })).notices[0], /другими настройками/);
 });
 
 test('архив шаблонов сохраняет связанные выгрузки, а удаление проверяет зависимости', async t => {
